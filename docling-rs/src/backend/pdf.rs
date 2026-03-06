@@ -1,10 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::Context;
 use base64::Engine;
-use lopdf::content::Operation;
-use lopdf::{Document, Encoding, Object, ObjectId};
 
 use crate::models::common::{DocItemLabel, GroupLabel, InputFormat};
 use crate::models::document::{compute_hash, doc_name_from_path, DoclingDocument};
@@ -18,31 +16,165 @@ use super::Backend;
 // Shared constants
 // ---------------------------------------------------------------------------
 
-/// Bullet glyphs that PDF documents use for unordered list items.
-/// These are the only characters treated as "stray markers" during
-/// paragraph fragment merging -- they have no other valid meaning when
-/// they appear as a standalone character on a line.
 const BULLET_GLYPHS: &[char] = &['•', '○', '■', '□', '◦', '▪'];
 
 // ---------------------------------------------------------------------------
-// Layout analysis structures (from content stream, no text decoding)
+// pdf_oxide integration types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct TextEvent {
-    x: f64,
-    _y: f64,
-    font_size: f64,
-    _byte_len: usize,
-}
+#[cfg(feature = "pdf-oxide")]
+use pdf_oxide::PdfDocument;
 
 #[derive(Debug, Clone)]
-struct PositionedText {
+struct AssembledBlock {
     text: String,
-    x: f64,
-    y: f64,
-    _font_size: f64,
+    bbox: (f64, f64, f64, f64), // l, t, r, b in TOPLEFT coords
+    font_size: f64,
+    is_artifact: bool,
 }
+
+// ---------------------------------------------------------------------------
+// pdf_oxide text assembly pipeline
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pdf-oxide")]
+fn assemble_page_blocks(
+    oxide_doc: &mut PdfDocument,
+    page_index: usize,
+    page_height: f64,
+) -> Vec<AssembledBlock> {
+    use pdf_oxide::pipeline::{
+        TextPipeline, TextPipelineConfig, ReadingOrderConfig,
+        ReadingOrderStrategyType, ReadingOrderContext,
+    };
+
+    let spans = match oxide_doc.extract_spans(page_index) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    if spans.is_empty() {
+        return Vec::new();
+    }
+
+    let mut config = TextPipelineConfig::default();
+    config.reading_order = ReadingOrderConfig {
+        strategy: ReadingOrderStrategyType::XYCut,
+    };
+
+    let pipeline = TextPipeline::with_config(config);
+    let context = ReadingOrderContext::default();
+
+    let ordered = match pipeline.process(spans, context) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    if ordered.is_empty() {
+        return Vec::new();
+    }
+
+    group_ordered_spans_into_blocks(&ordered, page_height)
+}
+
+#[cfg(feature = "pdf-oxide")]
+fn group_ordered_spans_into_blocks(
+    ordered: &[pdf_oxide::pipeline::OrderedTextSpan],
+    page_height: f64,
+) -> Vec<AssembledBlock> {
+    let mut blocks: Vec<AssembledBlock> = Vec::new();
+
+    let mut current_text = String::new();
+    let mut current_l = f64::MAX;
+    let mut current_t = f64::MAX;
+    let mut current_r = f64::MIN;
+    let mut current_b = f64::MIN;
+    let mut current_font_size: f64 = 0.0;
+    let mut current_font_count: usize = 0;
+    let mut current_is_artifact = false;
+    let mut prev_bottom: Option<f64> = None;
+    let mut prev_font_size: f64 = 0.0;
+
+    for ospan in ordered {
+        let span = &ospan.span;
+        let text = span.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let is_artifact = span.artifact_type.is_some();
+
+        let bbox = &span.bbox;
+        let span_l = bbox.x as f64;
+        let span_t = page_height - (bbox.y + bbox.height) as f64;
+        let span_r = (bbox.x + bbox.width) as f64;
+        let span_b = page_height - bbox.y as f64;
+        let span_fs = span.font_size as f64;
+        let line_height = (span_b - span_t).abs().max(span_fs);
+
+        let should_break = if let Some(pb) = prev_bottom {
+            let gap = (span_t - pb).abs();
+            let font_change = (span_fs - prev_font_size).abs() / prev_font_size.max(1.0);
+            let artifact_change = is_artifact != current_is_artifact;
+            gap > line_height * 1.2 || font_change > 0.25 || artifact_change
+        } else {
+            false
+        };
+
+        if should_break && !current_text.is_empty() {
+            blocks.push(AssembledBlock {
+                text: current_text.trim().to_string(),
+                bbox: (current_l, current_t, current_r, current_b),
+                font_size: if current_font_count > 0 {
+                    current_font_size / current_font_count as f64
+                } else {
+                    12.0
+                },
+                is_artifact: current_is_artifact,
+            });
+            current_text = String::new();
+            current_l = f64::MAX;
+            current_t = f64::MAX;
+            current_r = f64::MIN;
+            current_b = f64::MIN;
+            current_font_size = 0.0;
+            current_font_count = 0;
+        }
+
+        if !current_text.is_empty() {
+            current_text.push(' ');
+        }
+        current_text.push_str(text);
+        current_l = current_l.min(span_l);
+        current_t = current_t.min(span_t);
+        current_r = current_r.max(span_r);
+        current_b = current_b.max(span_b);
+        current_font_size += span_fs;
+        current_font_count += 1;
+        current_is_artifact = is_artifact;
+        prev_bottom = Some(span_b);
+        prev_font_size = span_fs;
+    }
+
+    if !current_text.trim().is_empty() {
+        blocks.push(AssembledBlock {
+            text: current_text.trim().to_string(),
+            bbox: (current_l, current_t, current_r, current_b),
+            font_size: if current_font_count > 0 {
+                current_font_size / current_font_count as f64
+            } else {
+                12.0
+            },
+            is_artifact: current_is_artifact,
+        });
+    }
+
+    blocks
+}
+
+// ---------------------------------------------------------------------------
+// lopdf path extraction (kept for table detection)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct PathSegment {
@@ -59,23 +191,6 @@ impl PathSegment {
     fn is_vertical(&self, tol: f64) -> bool {
         (self.x1 - self.x2).abs() < tol
     }
-}
-
-#[derive(Debug, Clone)]
-struct ImageInfo {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    data: Option<Vec<u8>>,
-    mimetype: Option<String>,
-}
-
-struct LayoutInfo {
-    text_events: Vec<TextEvent>,
-    positioned_texts: Vec<PositionedText>,
-    paths: Vec<PathSegment>,
-    images: Vec<ImageInfo>,
 }
 
 #[derive(Clone)]
@@ -109,436 +224,114 @@ fn ctm_transform(ctm: &[f64; 6], x: f64, y: f64) -> (f64, f64) {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Content stream analysis
-// ---------------------------------------------------------------------------
+fn extract_paths_from_page(
+    doc: &lopdf::Document,
+    page_id: lopdf::ObjectId,
+) -> Vec<PathSegment> {
+    let content_data = match doc.get_page_content(page_id) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let ops = match lopdf::content::Content::decode(&content_data) {
+        Ok(c) => c.operations,
+        Err(_) => return Vec::new(),
+    };
 
-fn analyze_page_layout(
-    doc: &Document,
-    page_id: ObjectId,
-) -> anyhow::Result<LayoutInfo> {
-    let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
-    let encodings: std::collections::BTreeMap<Vec<u8>, Encoding> = fonts
-        .into_iter()
-        .filter_map(|(name, font)| font.get_font_encoding(doc).ok().map(|enc| (name, enc)))
-        .collect();
+    let mut paths = Vec::new();
+    let mut gstate_stack: Vec<GState> = vec![GState::default()];
+    let mut current_gstate = GState::default();
+    let mut path_start: Option<(f64, f64)> = None;
+    let mut current_point: Option<(f64, f64)> = None;
+    let mut subpath_segments: Vec<PathSegment> = Vec::new();
 
-    let content = doc.get_and_decode_page_content(page_id)?;
+    for op in &ops {
+        let opname = op.operator.as_str();
+        let operands = &op.operands;
 
-    let mut text_events: Vec<TextEvent> = Vec::new();
-    let mut positioned_texts: Vec<PositionedText> = Vec::new();
-    let mut paths: Vec<PathSegment> = Vec::new();
-    let mut images: Vec<ImageInfo> = Vec::new();
-
-    let mut gs_stack: Vec<GState> = vec![GState::default()];
-    let mut current_encoding: Option<&Encoding> = None;
-    let mut font_size: f64 = 12.0;
-    let mut tm_x: f64 = 0.0;
-    let mut tm_y: f64 = 0.0;
-    let mut line_x: f64 = 0.0;
-    let mut line_y: f64 = 0.0;
-    let mut leading: f64 = 0.0;
-    let mut tm_scale_y: f64 = 1.0;
-
-    let mut path_x: f64 = 0.0;
-    let mut path_y: f64 = 0.0;
-    let mut pending_segments: Vec<PathSegment> = Vec::new();
-    let mut subpath_start: (f64, f64) = (0.0, 0.0);
-
-    let xobjects = get_page_xobjects(doc, page_id);
-
-    for Operation { operator, operands } in &content.operations {
-        let gs = gs_stack.last().cloned().unwrap_or_default();
-
-        match operator.as_str() {
-            "q" => gs_stack.push(gs.clone()),
+        match opname {
+            "q" => {
+                gstate_stack.push(current_gstate.clone());
+            }
             "Q" => {
-                if gs_stack.len() > 1 {
-                    gs_stack.pop();
+                if let Some(gs) = gstate_stack.pop() {
+                    current_gstate = gs;
                 }
             }
             "cm" => {
                 if operands.len() >= 6 {
-                    let m = [
-                        obj_as_f64(&operands[0]).unwrap_or(1.0),
-                        obj_as_f64(&operands[1]).unwrap_or(0.0),
-                        obj_as_f64(&operands[2]).unwrap_or(0.0),
-                        obj_as_f64(&operands[3]).unwrap_or(1.0),
-                        obj_as_f64(&operands[4]).unwrap_or(0.0),
-                        obj_as_f64(&operands[5]).unwrap_or(0.0),
-                    ];
-                    if let Some(top) = gs_stack.last_mut() {
-                        top.ctm = ctm_multiply(&m, &top.ctm);
+                    let vals: Vec<f64> = operands.iter().filter_map(|o| obj_as_f64(o)).collect();
+                    if vals.len() == 6 {
+                        let new_ctm = [vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]];
+                        current_gstate.ctm = ctm_multiply(&new_ctm, &current_gstate.ctm);
                     }
                 }
             }
-
-            "BT" => {
-                tm_x = 0.0;
-                tm_y = 0.0;
-                line_x = 0.0;
-                line_y = 0.0;
-                tm_scale_y = 1.0;
-            }
-            "ET" => {}
-            "Tf" => {
-                if let Some(name) = operands.first().and_then(|o| o.as_name().ok()) {
-                    current_encoding = encodings.get(name);
-                }
-                if operands.len() >= 2 {
-                    if let Some(s) = obj_as_f64(&operands[1]) {
-                        if s.abs() > 0.1 {
-                            font_size = s.abs();
-                        }
-                    }
-                }
-            }
-            "TL" => {
-                if let Some(tl) = operands.first().and_then(|o| obj_as_f64(o)) {
-                    leading = tl;
-                }
-            }
-            "Tm" => {
-                if operands.len() >= 6 {
-                    let d = obj_as_f64(&operands[3]).unwrap_or(1.0);
-                    let e = obj_as_f64(&operands[4]).unwrap_or(0.0);
-                    let f = obj_as_f64(&operands[5]).unwrap_or(0.0);
-                    tm_x = e;
-                    tm_y = f;
-                    line_x = e;
-                    line_y = f;
-                    tm_scale_y = d.abs().max(0.1);
-                }
-            }
-            "Td" => {
-                if operands.len() >= 2 {
-                    let tx = obj_as_f64(&operands[0]).unwrap_or(0.0);
-                    let ty = obj_as_f64(&operands[1]).unwrap_or(0.0);
-                    line_x += tx;
-                    line_y += ty;
-                    tm_x = line_x;
-                    tm_y = line_y;
-                }
-            }
-            "TD" => {
-                if operands.len() >= 2 {
-                    let tx = obj_as_f64(&operands[0]).unwrap_or(0.0);
-                    let ty = obj_as_f64(&operands[1]).unwrap_or(0.0);
-                    line_x += tx;
-                    line_y += ty;
-                    tm_x = line_x;
-                    tm_y = line_y;
-                    leading = -ty;
-                }
-            }
-            "T*" => {
-                line_y -= leading;
-                tm_x = line_x;
-                tm_y = line_y;
-            }
-            "Tj" | "TJ" | "'" | "\"" => {
-                let effective_size = font_size * tm_scale_y;
-                let (gx, gy) = ctm_transform(&gs.ctm, tm_x, tm_y);
-                let byte_len = operand_byte_len(operands);
-
-                text_events.push(TextEvent {
-                    x: gx,
-                    _y: gy,
-                    font_size: effective_size,
-                    _byte_len: byte_len,
-                });
-
-                if let Some(encoding) = current_encoding {
-                    let ops = match operator.as_str() {
-                        "\"" if operands.len() >= 3 => &operands[2..],
-                        _ => operands.as_slice(),
-                    };
-                    let text = decode_operands(encoding, ops);
-                    if !text.is_empty() {
-                        positioned_texts.push(PositionedText {
-                            text,
-                            x: gx,
-                            y: gy,
-                            _font_size: effective_size,
-                        });
-                    }
-                }
-
-                if operator == "'" || operator == "\"" {
-                    line_y -= leading;
-                    tm_x = line_x;
-                    tm_y = line_y;
-                }
-            }
-
-            // Path construction
             "m" => {
                 if operands.len() >= 2 {
-                    let x = obj_as_f64(&operands[0]).unwrap_or(0.0);
-                    let y = obj_as_f64(&operands[1]).unwrap_or(0.0);
-                    let (gx, gy) = ctm_transform(&gs.ctm, x, y);
-                    path_x = gx;
-                    path_y = gy;
-                    subpath_start = (gx, gy);
+                    if let (Some(x), Some(y)) = (obj_as_f64(&operands[0]), obj_as_f64(&operands[1]))
+                    {
+                        let (tx, ty) = ctm_transform(&current_gstate.ctm, x, y);
+                        path_start = Some((tx, ty));
+                        current_point = Some((tx, ty));
+                    }
                 }
             }
             "l" => {
                 if operands.len() >= 2 {
-                    let x = obj_as_f64(&operands[0]).unwrap_or(0.0);
-                    let y = obj_as_f64(&operands[1]).unwrap_or(0.0);
-                    let (gx, gy) = ctm_transform(&gs.ctm, x, y);
-                    pending_segments.push(PathSegment {
-                        x1: path_x,
-                        y1: path_y,
-                        x2: gx,
-                        y2: gy,
-                    });
-                    path_x = gx;
-                    path_y = gy;
+                    if let (Some(x), Some(y)) = (obj_as_f64(&operands[0]), obj_as_f64(&operands[1]))
+                    {
+                        let (tx, ty) = ctm_transform(&current_gstate.ctm, x, y);
+                        if let Some((cx, cy)) = current_point {
+                            subpath_segments.push(PathSegment {
+                                x1: cx,
+                                y1: cy,
+                                x2: tx,
+                                y2: ty,
+                            });
+                        }
+                        current_point = Some((tx, ty));
+                    }
                 }
             }
             "re" => {
                 if operands.len() >= 4 {
-                    let rx = obj_as_f64(&operands[0]).unwrap_or(0.0);
-                    let ry = obj_as_f64(&operands[1]).unwrap_or(0.0);
-                    let rw = obj_as_f64(&operands[2]).unwrap_or(0.0);
-                    let rh = obj_as_f64(&operands[3]).unwrap_or(0.0);
-                    let (x0, y0) = ctm_transform(&gs.ctm, rx, ry);
-                    let (x1, y1) = ctm_transform(&gs.ctm, rx + rw, ry + rh);
-                    pending_segments.push(PathSegment { x1: x0, y1: y0, x2: x1, y2: y0 });
-                    pending_segments.push(PathSegment { x1: x1, y1: y0, x2: x1, y2: y1 });
-                    pending_segments.push(PathSegment { x1: x1, y1: y1, x2: x0, y2: y1 });
-                    pending_segments.push(PathSegment { x1: x0, y1: y1, x2: x0, y2: y0 });
+                    let vals: Vec<f64> = operands.iter().filter_map(|o| obj_as_f64(o)).collect();
+                    if vals.len() == 4 {
+                        let (x0, y0) = ctm_transform(&current_gstate.ctm, vals[0], vals[1]);
+                        let (x1, y1) =
+                            ctm_transform(&current_gstate.ctm, vals[0] + vals[2], vals[1] + vals[3]);
+                        subpath_segments.push(PathSegment { x1: x0, y1: y0, x2: x1, y2: y0 });
+                        subpath_segments.push(PathSegment { x1: x1, y1: y0, x2: x1, y2: y1 });
+                        subpath_segments.push(PathSegment { x1: x1, y1: y1, x2: x0, y2: y1 });
+                        subpath_segments.push(PathSegment { x1: x0, y1: y1, x2: x0, y2: y0 });
+                        current_point = Some((x0, y0));
+                        path_start = Some((x0, y0));
+                    }
                 }
             }
             "h" => {
-                if (path_x - subpath_start.0).abs() > 0.01
-                    || (path_y - subpath_start.1).abs() > 0.01
-                {
-                    pending_segments.push(PathSegment {
-                        x1: path_x,
-                        y1: path_y,
-                        x2: subpath_start.0,
-                        y2: subpath_start.1,
-                    });
-                }
-                path_x = subpath_start.0;
-                path_y = subpath_start.1;
-            }
-            "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => {
-                paths.extend(pending_segments.drain(..));
-            }
-            "n" => {
-                pending_segments.clear();
-            }
-
-            "Do" => {
-                if let Some(name) = operands.first().and_then(|o| o.as_name().ok()) {
-                    if let Some(xobj_id) = xobjects.get(name) {
-                        if let Ok(obj) = doc.get_object(*xobj_id) {
-                            if let Ok(stream) = obj.as_stream() {
-                                let dict = &stream.dict;
-                                let subtype = dict
-                                    .get(b"Subtype")
-                                    .ok()
-                                    .and_then(|o| o.as_name().ok())
-                                    .unwrap_or(b"");
-                                if subtype == b"Image" {
-                                    let (gx, gy) = ctm_transform(&gs.ctm, 0.0, 0.0);
-                                    let w = (gs.ctm[0].powi(2) + gs.ctm[1].powi(2)).sqrt();
-                                    let h = (gs.ctm[2].powi(2) + gs.ctm[3].powi(2)).sqrt();
-
-                                    let (data, mimetype) =
-                                        extract_image_bytes(doc, stream, *xobj_id);
-
-                                    images.push(ImageInfo {
-                                        x: gx,
-                                        y: gy,
-                                        width: w,
-                                        height: h,
-                                        data,
-                                        mimetype,
-                                    });
-                                }
-                            }
-                        }
+                if let (Some(cp), Some(ps)) = (current_point, path_start) {
+                    if (cp.0 - ps.0).abs() > 0.01 || (cp.1 - ps.1).abs() > 0.01 {
+                        subpath_segments.push(PathSegment {
+                            x1: cp.0,
+                            y1: cp.1,
+                            x2: ps.0,
+                            y2: ps.1,
+                        });
                     }
+                    current_point = path_start;
                 }
+            }
+            "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "n" => {
+                paths.append(&mut subpath_segments);
+                path_start = None;
+                current_point = None;
             }
             _ => {}
         }
     }
 
-    Ok(LayoutInfo {
-        text_events,
-        positioned_texts,
-        paths,
-        images,
-    })
-}
-
-fn operand_byte_len(operands: &[Object]) -> usize {
-    let mut len = 0;
-    for op in operands {
-        match op {
-            Object::String(bytes, _) => len += bytes.len(),
-            Object::Array(arr) => {
-                for item in arr {
-                    if let Object::String(bytes, _) = item {
-                        len += bytes.len();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    len
-}
-
-fn get_page_xobjects(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, ObjectId> {
-    let mut result = HashMap::new();
-    let page_dict = match doc.get_object(page_id).ok().and_then(|o| o.as_dict().ok()) {
-        Some(d) => d,
-        None => return result,
-    };
-
-    let resources = match page_dict.get(b"Resources") {
-        Ok(obj) => resolve_dict(doc, obj),
-        Err(_) => {
-            if let Ok(parent_ref) = page_dict.get(b"Parent") {
-                if let Ok(parent_id) = parent_ref.as_reference() {
-                    if let Ok(parent_obj) = doc.get_object(parent_id) {
-                        if let Ok(parent_dict) = parent_obj.as_dict() {
-                            parent_dict.get(b"Resources").ok().and_then(|o| resolve_dict(doc, o))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-    };
-
-    if let Some(res_dict) = resources {
-        if let Ok(xobj_obj) = res_dict.get(b"XObject") {
-            if let Some(xobj_dict) = resolve_dict(doc, xobj_obj) {
-                for (name, val) in xobj_dict.iter() {
-                    if let Ok(id) = val.as_reference() {
-                        result.insert(name.clone(), id);
-                    }
-                }
-            }
-        }
-    }
-
-    result
-}
-
-fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dictionary> {
-    match obj {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_dict().ok()),
-        _ => None,
-    }
-}
-
-fn decode_operands(encoding: &Encoding, operands: &[Object]) -> String {
-    let mut text = String::new();
-    for operand in operands {
-        match operand {
-            Object::String(bytes, _) => {
-                if let Ok(decoded) = Document::decode_text(encoding, bytes) {
-                    text.push_str(&decoded);
-                }
-            }
-            Object::Array(arr) => {
-                for item in arr {
-                    match item {
-                        Object::String(bytes, _) => {
-                            if let Ok(decoded) = Document::decode_text(encoding, bytes) {
-                                text.push_str(&decoded);
-                            }
-                        }
-                        Object::Integer(i) if *i < -100 => text.push(' '),
-                        Object::Real(f) if *f < -100.0 => text.push(' '),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    text
-}
-
-// ---------------------------------------------------------------------------
-// Column detection from layout info
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum ColumnLayout {
-    Single,
-    TwoColumn { boundary: f64 },
-}
-
-fn detect_columns(events: &[TextEvent], page_width: f64) -> ColumnLayout {
-    if events.len() < 10 {
-        return ColumnLayout::Single;
-    }
-
-    let midpoint = page_width / 2.0;
-    let margin = page_width * 0.08;
-
-    let mut left_count = 0;
-    let mut right_count = 0;
-
-    for ev in events {
-        if ev.x > margin && ev.x < midpoint - margin {
-            left_count += 1;
-        }
-        if ev.x > midpoint + margin && ev.x < page_width - margin {
-            right_count += 1;
-        }
-    }
-
-    if left_count >= 5 && right_count >= 5 {
-        ColumnLayout::TwoColumn { boundary: midpoint }
-    } else {
-        ColumnLayout::Single
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Font size analysis for classification
-// ---------------------------------------------------------------------------
-
-struct FontSizeInfo {
-    _body_size: f64,
-    sizes_per_event: Vec<f64>,
-}
-
-fn analyze_font_sizes(events: &[TextEvent]) -> FontSizeInfo {
-    let sizes: Vec<f64> = events.iter().map(|e| e.font_size).collect();
-    let body_size = median_f64(&sizes);
-    FontSizeInfo {
-        _body_size: body_size,
-        sizes_per_event: sizes,
-    }
-}
-
-fn median_f64(vals: &[f64]) -> f64 {
-    if vals.is_empty() {
-        return 12.0;
-    }
-    let mut sorted = vals.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    sorted[sorted.len() / 2]
+    paths
 }
 
 // ---------------------------------------------------------------------------
@@ -580,7 +373,6 @@ fn detect_table_regions(paths: &[PathSegment], page_height: f64) -> Vec<TableReg
         }
     }
 
-    // Require enough lines for a real table grid (at least 3 rows, 2 cols)
     if h_lines.len() < 4 || v_lines.len() < 3 {
         return Vec::new();
     }
@@ -640,11 +432,9 @@ fn dedup_sorted(vals: &[f64], tol: f64) -> Vec<f64> {
     result
 }
 
-// Assign positioned text fragments to table cells
-fn build_table_from_texts(
-    texts: &[PositionedText],
+fn build_table_from_blocks(
+    blocks: &[AssembledBlock],
     region: &TableRegion,
-    page_height: f64,
 ) -> Option<(Vec<Vec<String>>, usize, usize)> {
     let num_rows = region.h_lines.len().saturating_sub(1);
     let num_cols = region.v_lines.len().saturating_sub(1);
@@ -654,32 +444,32 @@ fn build_table_from_texts(
 
     let mut grid: Vec<Vec<String>> = vec![vec![String::new(); num_cols]; num_rows];
 
-    for pt in texts {
-        let ty = page_height - pt.y;
-        if ty < region.y_min - 5.0 || ty > region.y_max + 5.0 {
+    for block in blocks {
+        let (bl, bt, _br, _bb) = block.bbox;
+        if bt < region.y_min - 5.0 || bt > region.y_max + 5.0 {
             continue;
         }
-        if pt.x < region.x_min - 5.0 || pt.x > region.x_max + 5.0 {
+        if bl < region.x_min - 5.0 || bl > region.x_max + 5.0 {
             continue;
         }
 
         let col = region
             .v_lines
             .windows(2)
-            .position(|w| pt.x >= w[0] - 5.0 && pt.x <= w[1] + 5.0)
+            .position(|w| bl >= w[0] - 5.0 && bl <= w[1] + 5.0)
             .unwrap_or(0)
             .min(num_cols - 1);
         let row = region
             .h_lines
             .windows(2)
-            .position(|w| ty >= w[0] - 5.0 && ty <= w[1] + 5.0)
+            .position(|w| bt >= w[0] - 5.0 && bt <= w[1] + 5.0)
             .unwrap_or(0)
             .min(num_rows - 1);
 
         if !grid[row][col].is_empty() {
             grid[row][col].push(' ');
         }
-        grid[row][col].push_str(pt.text.trim());
+        grid[row][col].push_str(block.text.trim());
     }
 
     Some((grid, num_rows, num_cols))
@@ -692,7 +482,6 @@ fn build_table_from_texts(
 fn sanitize_text(text: &str) -> String {
     let mut result = text.to_string();
 
-    // Ligatures
     result = result
         .replace('\u{FB00}', "ff")
         .replace('\u{FB01}', "fi")
@@ -702,21 +491,18 @@ fn sanitize_text(text: &str) -> String {
         .replace('\u{FB05}', "st")
         .replace('\u{FB06}', "st");
 
-    // Unicode normalization (matching Python docling behaviour)
     result = result
-        .replace('\u{2044}', "/")  // fraction slash
-        .replace('\u{2019}', "'")  // right single quote
-        .replace('\u{2018}', "'")  // left single quote
-        .replace('\u{201C}', "\"") // left double quote
-        .replace('\u{201D}', "\"") // right double quote
-        .replace('\u{00A0}', " "); // non-breaking space
+        .replace('\u{2044}', "/")
+        .replace('\u{2019}', "'")
+        .replace('\u{2018}', "'")
+        .replace('\u{201C}', "\"")
+        .replace('\u{201D}', "\"")
+        .replace('\u{00A0}', " ");
 
-    // Hyphenation joining and whitespace collapsing
     let mut out = String::with_capacity(result.len());
     let chars: Vec<char> = result.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        // Join hyphenated words split across lines
         if chars[i] == '-'
             && i + 1 < chars.len()
             && chars[i + 1] == '\n'
@@ -733,7 +519,6 @@ fn sanitize_text(text: &str) -> String {
             }
         }
 
-        // Collapse runs of spaces (not newlines) into a single space
         if chars[i] == ' ' && i + 1 < chars.len() && chars[i + 1] == ' ' {
             out.push(' ');
             while i < chars.len() && chars[i] == ' ' {
@@ -749,133 +534,13 @@ fn sanitize_text(text: &str) -> String {
     out
 }
 
-fn split_paragraphs(text: &str) -> Vec<&str> {
-    text.split("\n\n")
-        .flat_map(|block| split_single_newline_paragraphs(block))
-        .filter(|s| !s.trim().is_empty())
-        .collect()
-}
-
-fn split_single_newline_paragraphs(block: &str) -> Vec<&str> {
-    let lines: Vec<&str> = block.lines().collect();
-    if lines.len() <= 1 {
-        return vec![block];
+fn median_f64(vals: &[f64]) -> f64 {
+    if vals.is_empty() {
+        return 12.0;
     }
-
-    let avg_len = {
-        let total: usize = lines.iter().map(|l| l.trim().len()).sum();
-        (total as f64 / lines.len() as f64).max(1.0)
-    };
-
-    let mut result = Vec::new();
-    let mut start = 0;
-    let block_bytes = block.as_bytes();
-    let mut byte_offset = 0;
-
-    for (i, line) in lines.iter().enumerate() {
-        let line_start = byte_offset;
-        byte_offset += line.len();
-        if i < lines.len() - 1 {
-            byte_offset += 1;
-        }
-        if i < lines.len() - 1 {
-            let trimmed_len = line.trim().len();
-            if trimmed_len > 0 && (trimmed_len as f64) < avg_len * 0.4 {
-                let end = line_start + line.len();
-                let segment = &block[start..end];
-                if !segment.trim().is_empty() {
-                    result.push(segment.trim());
-                }
-                start = end;
-                while start < block_bytes.len() && block_bytes[start] == b'\n' {
-                    start += 1;
-                }
-            }
-        }
-    }
-
-    if start < block.len() {
-        let tail = &block[start..];
-        if !tail.trim().is_empty() {
-            result.push(tail.trim());
-        }
-    }
-
-    if result.is_empty() {
-        vec![block]
-    } else {
-        result
-    }
-}
-
-/// Reassociate stray bullet glyphs that PDF text extraction attached to the
-/// wrong paragraph.
-///
-/// PDF layout often produces text like `"Item1 \n•"` where the trailing `•`
-/// actually belongs to the *next* list item. This function strips those
-/// trailing bullets and prepends them to the following paragraph, then drops
-/// any paragraphs that were left empty or consist only of a lone bullet.
-fn merge_fragment_paragraphs(paragraphs: &[&str]) -> Vec<String> {
-    let mut result: Vec<String> = Vec::with_capacity(paragraphs.len());
-    let mut carry_bullet: Option<char> = None;
-
-    for &para in paragraphs {
-        let trimmed = para.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Prepend any bullet carried from the previous paragraph
-        let mut text = if let Some(bullet) = carry_bullet.take() {
-            format!("{} {}", bullet, trimmed)
-        } else {
-            trimmed.to_string()
-        };
-
-        // Strip a leading `<bullet>\n` — the bullet was a leftover from the
-        // previous text block, not a marker for this paragraph.
-        if let Some(first_char) = text.chars().next() {
-            if BULLET_GLYPHS.contains(&first_char) {
-                let after = &text[first_char.len_utf8()..];
-                if after.starts_with('\n') {
-                    text = after[1..].to_string();
-                }
-            }
-        }
-
-        // Detect a trailing `\n<bullet>` and carry the bullet forward.
-        if let Some(last_char) = text.trim_end().chars().next_back() {
-            if BULLET_GLYPHS.contains(&last_char) {
-                let trimmed = text.trim_end();
-                let before_bullet = &trimmed[..trimmed.len() - last_char.len_utf8()];
-                // The bullet must be preceded by a newline (possibly with spaces)
-                if before_bullet.ends_with('\n')
-                    || before_bullet.trim_end().ends_with('\n')
-                    || before_bullet.trim().is_empty()
-                {
-                    carry_bullet = Some(last_char);
-                    text = before_bullet.trim_end().trim_end_matches('\n').to_string();
-                }
-            }
-        }
-
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        // Drop paragraphs that are a lone bullet glyph (after all stripping)
-        if text.chars().count() == 1 && BULLET_GLYPHS.contains(&text.chars().next().unwrap()) {
-            carry_bullet = Some(text.chars().next().unwrap());
-            continue;
-        }
-
-        result.push(text.to_string());
-    }
-
-    // A trailing carried bullet with nothing after it is discarded.
-
-    result
+    let mut sorted = vals.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted[sorted.len() / 2]
 }
 
 fn classify_paragraph(
@@ -889,17 +554,14 @@ fn classify_paragraph(
         return DocItemLabel::Caption;
     }
 
-    // Check list items early so they aren't mis-classified as headings
     if looks_like_list_item(trimmed) {
         return DocItemLabel::ListItem;
     }
 
-    // Structural section header patterns (numbered sections, "Chapter", etc.)
     if looks_like_section_header(trimmed) {
         return DocItemLabel::SectionHeader;
     }
 
-    // Font-size based heading detection (strong signal)
     if let Some(fs) = local_font_size {
         let ratio = fs / body_font_size;
         if ratio >= 1.3 && trimmed.len() < 200 && trimmed.lines().count() <= 3 {
@@ -907,7 +569,6 @@ fn classify_paragraph(
         }
     }
 
-    // Short single-line text: only promote to heading with moderate font-size evidence
     let line_count = trimmed.lines().count();
     let char_count = trimmed.len();
     if line_count == 1 && char_count < 80 && char_count > 1 {
@@ -940,13 +601,109 @@ fn classify_paragraph(
     DocItemLabel::Text
 }
 
+fn looks_like_caption(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 200 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    lower.starts_with("figure ")
+        || lower.starts_with("fig. ")
+        || lower.starts_with("fig ")
+        || lower.starts_with("table ")
+        || lower.starts_with("tab. ")
+        || lower.starts_with("listing ")
+        || lower.starts_with("algorithm ")
+        || lower.starts_with("scheme ")
+}
+
+fn looks_like_section_header(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 120 || trimmed.lines().count() > 2 {
+        return false;
+    }
+
+    let first_word = match trimmed.split_whitespace().next() {
+        Some(w) => w,
+        None => return false,
+    };
+    let cleaned = first_word.trim_end_matches('.');
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    if cleaned.chars().all(|c| c.is_ascii_digit() || c == '.') && cleaned.chars().any(|c| c.is_ascii_digit()) {
+        let rest = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
+        return !rest.is_empty() && rest.len() < 100;
+    }
+
+    let mut chars = cleaned.chars();
+    if let Some(first_ch) = chars.next() {
+        if first_ch.is_ascii_uppercase() {
+            let rest_str: String = chars.collect();
+            let is_section_number = rest_str.is_empty()
+                || rest_str.chars().all(|c| c.is_ascii_digit() || c == '.');
+            if is_section_number {
+                let rest = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
+                return !rest.is_empty() && rest.len() < 100;
+            }
+        }
+    }
+
+    let lower_first = first_word.to_lowercase();
+    if matches!(lower_first.as_str(), "chapter" | "part" | "section" | "appendix") {
+        let rest = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
+        if !rest.is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn guess_heading_level(text: &str, size_ratio: f64) -> u32 {
+    let first_word = text.split_whitespace().next().unwrap_or("");
+    let cleaned = first_word.trim_end_matches('.');
+
+    if !cleaned.is_empty() && cleaned.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        let dots = cleaned.chars().filter(|&c| c == '.').count();
+        return match dots {
+            0 => 1,
+            1 => 2,
+            _ => (dots as u32 + 1).min(6),
+        };
+    }
+
+    if !cleaned.is_empty() {
+        let mut chars = cleaned.chars();
+        if let Some(first) = chars.next() {
+            if first.is_ascii_uppercase() {
+                let rest: String = chars.collect();
+                if rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                    let dots = rest.chars().filter(|&c| c == '.').count();
+                    return ((1 + dots) as u32).min(6);
+                }
+            }
+        }
+    }
+
+    if size_ratio >= 1.8 {
+        1
+    } else if size_ratio >= 1.4 {
+        2
+    } else if size_ratio >= 1.2 {
+        3
+    } else {
+        2
+    }
+}
+
 fn starts_with_bullet(text: &str) -> bool {
     if let Some(first) = text.chars().next() {
         if BULLET_GLYPHS.contains(&first) {
             let rest = &text[first.len_utf8()..];
             return rest.starts_with(' ') || rest.is_empty();
         }
-        // Hyphen-minus and typographic dashes followed by a space
         if (first == '-' || first == '–' || first == '—') && text.len() > 2 {
             return text[first.len_utf8()..].starts_with(' ');
         }
@@ -958,16 +715,14 @@ fn starts_with_ordered_marker(text: &str) -> Option<usize> {
     let trimmed = text.trim();
     let bytes = trimmed.as_bytes();
 
-    // "1. ", "12) " style
     if !bytes.is_empty() && bytes[0].is_ascii_digit() {
         if let Some(pos) = trimmed.find(|c: char| !c.is_ascii_digit()) {
             let after = &trimmed[pos..];
             if after.starts_with(". ") || after.starts_with(") ") {
-                return Some(pos + 1); // length up to and including the `.` or `)`
+                return Some(pos + 1);
             }
         }
     }
-    // "(a) " style
     if trimmed.starts_with('(') {
         if let Some(close) = trimmed.find(')') {
             if close < 6 && trimmed.len() > close + 2 && trimmed.as_bytes()[close + 1] == b' ' {
@@ -990,7 +745,6 @@ fn looks_like_numbered_list(text: &str) -> bool {
     starts_with_ordered_marker(text.trim()).is_some()
 }
 
-/// Return the marker string for a list item (e.g. `"•"`, `"-"`, `"1."`, `"(a)"`).
 fn extract_list_marker(text: &str) -> Option<String> {
     let trimmed = text.trim();
 
@@ -1010,11 +764,9 @@ fn extract_list_marker(text: &str) -> Option<String> {
     None
 }
 
-/// Strip the leading marker (and trailing space) from list-item text.
 fn strip_list_marker(text: &str) -> String {
     let trimmed = text.trim();
 
-    // Bullet or dash marker: single char + space
     if let Some(first) = trimmed.chars().next() {
         if BULLET_GLYPHS.contains(&first) || first == '-' || first == '–' || first == '—' {
             let rest = &trimmed[first.len_utf8()..];
@@ -1024,7 +776,6 @@ fn strip_list_marker(text: &str) -> String {
         }
     }
 
-    // Ordered marker: "1. text" or "(a) text"
     if let Some(marker_end) = starts_with_ordered_marker(trimmed) {
         let after = &trimmed[marker_end..];
         return after.trim_start().to_string();
@@ -1033,270 +784,54 @@ fn strip_list_marker(text: &str) -> String {
     trimmed.to_string()
 }
 
-fn looks_like_caption(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.len() > 200 {
-        return false;
-    }
-    let lower = trimmed.to_lowercase();
-    lower.starts_with("figure ")
-        || lower.starts_with("fig. ")
-        || lower.starts_with("fig ")
-        || lower.starts_with("table ")
-        || lower.starts_with("tab. ")
-        || lower.starts_with("listing ")
-        || lower.starts_with("algorithm ")
-        || lower.starts_with("scheme ")
-}
-
-/// Detect headings with explicit structural numbering.
-///
-/// Matches two reliable patterns that don't depend on font size:
-///   1. Leading section number: `"1 Intro"`, `"1.2 Methods"`, `"A.1 Appendix"`
-///   2. Structural keyword + identifier: `"Chapter 3"`, `"Part II"`,
-///      `"Section 1.2"`, `"Appendix A"`
-fn looks_like_section_header(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.len() > 120 || trimmed.lines().count() > 2 {
-        return false;
-    }
-
-    let first_word = match trimmed.split_whitespace().next() {
-        Some(w) => w,
-        None => return false,
-    };
-    let cleaned = first_word.trim_end_matches('.');
-    if cleaned.is_empty() {
-        return false;
-    }
-
-    // Pattern 1: leading section number — "1", "1.2", "1.2.3"
-    if cleaned.chars().all(|c| c.is_ascii_digit() || c == '.') && cleaned.chars().any(|c| c.is_ascii_digit()) {
-        let rest = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
-        return !rest.is_empty() && rest.len() < 100;
-    }
-
-    // Pattern 1b: letter-number — "A", "A.1", "B.2.3"
-    let mut chars = cleaned.chars();
-    if let Some(first_ch) = chars.next() {
-        if first_ch.is_ascii_uppercase() {
-            let rest_str: String = chars.collect();
-            let is_section_number = rest_str.is_empty()
-                || rest_str.chars().all(|c| c.is_ascii_digit() || c == '.');
-            if is_section_number {
-                let rest = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
-                return !rest.is_empty() && rest.len() < 100;
-            }
-        }
-    }
-
-    // Pattern 2: structural keyword followed by a number/letter identifier
-    let lower_first = first_word.to_lowercase();
-    if matches!(lower_first.as_str(), "chapter" | "part" | "section" | "appendix") {
-        let rest = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
-        if !rest.is_empty() {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Estimate heading level (1–6) from section numbering depth and font-size ratio.
-///
-/// The hierarchy is determined primarily by structural cues:
-///   - Explicit numbering depth: `1` → level 1, `1.2` → level 2, `1.2.3` → level 3.
-///   - Font-size ratio: the bigger the heading relative to body text, the
-///     higher the level.
-fn guess_heading_level(text: &str, size_ratio: f64) -> u32 {
-    let first_word = text.split_whitespace().next().unwrap_or("");
-    let cleaned = first_word.trim_end_matches('.');
-
-    // Numbered sections: "1" = level 1, "1.2" = level 2, "1.2.3" = level 3
-    if !cleaned.is_empty() && cleaned.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        let dots = cleaned.chars().filter(|&c| c == '.').count();
-        return match dots {
-            0 => 1,
-            1 => 2,
-            _ => (dots as u32 + 1).min(6),
-        };
-    }
-
-    // Letter-number section numbering: "A" = 1, "A.1" = 2, "A.1.2" = 3
-    if !cleaned.is_empty() {
-        let mut chars = cleaned.chars();
-        if let Some(first) = chars.next() {
-            if first.is_ascii_uppercase() {
-                let rest: String = chars.collect();
-                if rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                    let dots = rest.chars().filter(|&c| c == '.').count();
-                    return ((1 + dots) as u32).min(6);
-                }
-            }
-        }
-    }
-
-    // Fall back to font-size ratio
-    if size_ratio >= 1.8 {
-        1
-    } else if size_ratio >= 1.4 {
-        2
-    } else if size_ratio >= 1.2 {
-        3
-    } else {
-        2
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Multi-column reordering using positioned text
-// ---------------------------------------------------------------------------
-
-fn reorder_multicolumn_text(
-    positioned_texts: &[PositionedText],
-    page_height: f64,
-    boundary: f64,
-) -> String {
-    let mut left_lines: Vec<(f64, String)> = Vec::new();
-    let mut right_lines: Vec<(f64, String)> = Vec::new();
-
-    let tol = 5.0;
-    let mut sorted: Vec<&PositionedText> = positioned_texts.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.y.partial_cmp(&b.y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .reverse()
-            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
-    struct Line {
-        y: f64,
-        x_center: f64,
-        text: String,
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-    for pt in &sorted {
-        if pt.text.trim().is_empty() {
-            continue;
-        }
-        let top_y = page_height - pt.y;
-        if let Some(last) = lines.last_mut() {
-            if (top_y - last.y).abs() < tol {
-                if !last.text.is_empty() && !last.text.ends_with(' ') && !pt.text.starts_with(' ') {
-                    last.text.push(' ');
-                }
-                last.text.push_str(&pt.text);
-                continue;
-            }
-        }
-        lines.push(Line {
-            y: top_y,
-            x_center: pt.x,
-            text: pt.text.clone(),
-        });
-    }
-
-    for line in &lines {
-        if line.x_center < boundary {
-            left_lines.push((line.y, line.text.clone()));
-        } else {
-            right_lines.push((line.y, line.text.clone()));
-        }
-    }
-
-    left_lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    right_lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut result = String::new();
-
-    emit_column_lines(&left_lines, &mut result);
-    result.push_str("\n\n");
-    emit_column_lines(&right_lines, &mut result);
-
-    result
-}
-
-fn emit_column_lines(lines: &[(f64, String)], out: &mut String) {
-    let mut prev_y = f64::MIN;
-    for (y, text) in lines {
-        let gap = y - prev_y;
-        if gap > 20.0 && prev_y > f64::MIN {
-            out.push_str("\n\n");
-        } else if prev_y > f64::MIN {
-            // Join lines that end with a hyphen followed by a lowercase start
-            if out.ends_with('-') {
-                let next_start = text.chars().next();
-                if next_start.is_some_and(|c| c.is_lowercase()) {
-                    out.pop(); // remove trailing hyphen
-                    out.push_str(text);
-                    prev_y = *y;
-                    continue;
-                }
-            }
-            out.push('\n');
-        }
-        out.push_str(text);
-        prev_y = *y;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Page header/footer detection
 // ---------------------------------------------------------------------------
 
-/// Detect repeated header/footer text across pages.
-///
-/// We check the first few and last few lines on each page and look for
-/// short text that appears on at least 30% of the pages (minimum 2).
-/// This catches page numbers, running titles, and copyright lines without
-/// relying on keyword matching.
-fn detect_page_furniture(
-    page_texts: &[(u32, &str)],
+fn detect_page_furniture_from_blocks(
+    page_blocks: &[(u32, Vec<AssembledBlock>)],
 ) -> (Vec<String>, Vec<String>) {
-    if page_texts.len() < 2 {
+    if page_blocks.len() < 2 {
         return (Vec::new(), Vec::new());
     }
 
     const MAX_LINE_LEN: usize = 120;
-    const HEADER_LINES: usize = 3;
-    const FOOTER_LINES: usize = 3;
+    const HEADER_BLOCKS: usize = 2;
+    const FOOTER_BLOCKS: usize = 2;
 
     let mut header_counts: HashMap<String, usize> = HashMap::new();
     let mut footer_counts: HashMap<String, usize> = HashMap::new();
 
-    for (_, text) in page_texts {
-        let lines: Vec<&str> = text.lines().collect();
+    for (_page_num, blocks) in page_blocks {
+        let non_artifact: Vec<&AssembledBlock> = blocks.iter().filter(|b| !b.is_artifact).collect();
 
-        let mut seen_header: HashSet<String> = HashSet::new();
-        for line in lines.iter().take(HEADER_LINES) {
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() && trimmed.len() < MAX_LINE_LEN && seen_header.insert(trimmed.clone()) {
-                *header_counts.entry(trimmed).or_insert(0) += 1;
+        for block in non_artifact.iter().take(HEADER_BLOCKS) {
+            let text = block.text.trim().to_string();
+            if !text.is_empty() && text.len() < MAX_LINE_LEN {
+                *header_counts.entry(text).or_insert(0) += 1;
             }
         }
 
-        let mut seen_footer: HashSet<String> = HashSet::new();
-        let footer_start = lines.len().saturating_sub(FOOTER_LINES);
-        for line in lines.iter().skip(footer_start) {
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() && trimmed.len() < MAX_LINE_LEN && seen_footer.insert(trimmed.clone()) {
-                *footer_counts.entry(trimmed).or_insert(0) += 1;
+        for block in non_artifact.iter().rev().take(FOOTER_BLOCKS) {
+            let text = block.text.trim().to_string();
+            if !text.is_empty() && text.len() < MAX_LINE_LEN {
+                *footer_counts.entry(text).or_insert(0) += 1;
             }
         }
     }
 
-    let total = page_texts.len();
-    let min_pages = ((total as f64 * 0.3).ceil() as usize).max(2);
+    let threshold = (page_blocks.len() as f64 * 0.3).ceil() as usize;
+    let min_pages = 2;
 
     let headers: Vec<String> = header_counts
         .into_iter()
-        .filter(|(_, count)| *count >= min_pages)
+        .filter(|(_, count)| *count >= threshold && *count >= min_pages)
         .map(|(text, _)| text)
         .collect();
+
     let footers: Vec<String> = footer_counts
         .into_iter()
-        .filter(|(_, count)| *count >= min_pages)
+        .filter(|(_, count)| *count >= threshold && *count >= min_pages)
         .map(|(text, _)| text)
         .collect();
 
@@ -1307,15 +842,27 @@ fn detect_page_furniture(
 // Utility
 // ---------------------------------------------------------------------------
 
-fn obj_as_f64(obj: &Object) -> Option<f64> {
+fn obj_as_f64(obj: &lopdf::Object) -> Option<f64> {
     match obj {
-        Object::Integer(i) => Some(*i as f64),
-        Object::Real(f) => Some(*f as f64),
+        lopdf::Object::Integer(i) => Some(*i as f64),
+        lopdf::Object::Real(f) => Some(*f as f64),
         _ => None,
     }
 }
 
-fn resolve_page_size(doc: &Document, page_id: ObjectId) -> Option<(f64, f64)> {
+#[cfg(feature = "pdf-oxide")]
+fn resolve_page_size_oxide(oxide_doc: &mut PdfDocument, page_index: usize) -> (f64, f64) {
+    match oxide_doc.get_page_media_box(page_index) {
+        Ok((x0, y0, x1, y1)) => (
+            (x1 as f64 - x0 as f64).abs(),
+            (y1 as f64 - y0 as f64).abs(),
+        ),
+        Err(_) => (612.0, 792.0),
+    }
+}
+
+#[allow(dead_code)]
+fn resolve_page_size_lopdf(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<(f64, f64)> {
     if let Some(dims) = try_box_from_dict(doc, page_id, b"CropBox") {
         return Some(dims);
     }
@@ -1343,7 +890,8 @@ fn resolve_page_size(doc: &Document, page_id: ObjectId) -> Option<(f64, f64)> {
     None
 }
 
-fn try_box_from_dict(doc: &Document, obj_id: ObjectId, key: &[u8]) -> Option<(f64, f64)> {
+#[allow(dead_code)]
+fn try_box_from_dict(doc: &lopdf::Document, obj_id: lopdf::ObjectId, key: &[u8]) -> Option<(f64, f64)> {
     let dict = doc.get_object(obj_id).ok()?.as_dict().ok()?;
     let arr = dict.get(key).ok().and_then(|obj| resolve_array(doc, obj))?;
     if arr.len() >= 4 {
@@ -1357,11 +905,75 @@ fn try_box_from_dict(doc: &Document, obj_id: ObjectId, key: &[u8]) -> Option<(f6
     }
 }
 
-fn resolve_array(doc: &Document, obj: &Object) -> Option<Vec<Object>> {
+#[allow(dead_code)]
+fn resolve_array(doc: &lopdf::Document, obj: &lopdf::Object) -> Option<Vec<lopdf::Object>> {
     match obj {
-        Object::Array(arr) => Some(arr.clone()),
-        Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_array().ok().cloned()),
+        lopdf::Object::Array(arr) => Some(arr.clone()),
+        lopdf::Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_array().ok().cloned()),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image extraction via pdf_oxide
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pdf-oxide")]
+fn emit_images_oxide(
+    doc: &mut DoclingDocument,
+    oxide_doc: &mut PdfDocument,
+    page_index: usize,
+    page_num: u32,
+    page_height: f64,
+) {
+    let images = match oxide_doc.extract_images(page_index) {
+        Ok(imgs) => imgs,
+        Err(_) => return,
+    };
+
+    for img in &images {
+        let (img_l, img_t, img_r, img_b) = if let Some(bbox) = img.bbox() {
+            (
+                bbox.x as f64,
+                page_height - (bbox.y + bbox.height) as f64,
+                (bbox.x + bbox.width) as f64,
+                page_height - bbox.y as f64,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
+        let idx = doc.add_picture(None, None);
+        doc.pictures[idx].prov.push(ProvenanceItem {
+            page_no: page_num,
+            bbox: BoundingBox {
+                l: img_l,
+                t: img_t,
+                r: img_r,
+                b: img_b,
+                coord_origin: Some("TOPLEFT".to_string()),
+            },
+            charspan: None,
+        });
+
+        if let Ok(png_bytes) = img.to_png_bytes() {
+            let px_w = img.width() as f64;
+            let px_h = img.height() as f64;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            let uri = format!("data:image/png;base64,{}", b64);
+            doc.set_picture_image(
+                idx,
+                ImageRef {
+                    mimetype: "image/png".to_string(),
+                    dpi: 72,
+                    size: ImageSize {
+                        width: px_w,
+                        height: px_h,
+                    },
+                    uri,
+                },
+            );
+        }
     }
 }
 
@@ -1371,6 +983,7 @@ fn resolve_array(doc: &Document, obj: &Object) -> Option<Vec<Object>> {
 
 pub struct PdfBackend;
 
+#[cfg(feature = "pdf-oxide")]
 impl Backend for PdfBackend {
     fn convert(&self, path: &Path) -> anyhow::Result<DoclingDocument> {
         let data = std::fs::read(path)
@@ -1383,29 +996,37 @@ impl Backend for PdfBackend {
         let name = doc_name_from_path(path);
         let mut doc = DoclingDocument::new(&name, filename, InputFormat::Pdf.mimetype(), hash);
 
-        let pdf_doc = Document::load_mem(&data)
-            .with_context(|| format!("Failed to parse PDF: {}", path.display()))?;
+        let mut oxide_doc = PdfDocument::from_bytes(data.clone())
+            .with_context(|| format!("pdf_oxide failed to parse PDF: {}", path.display()))?;
 
-        let pages = pdf_doc.get_pages();
-        let mut page_numbers: Vec<u32> = pages.keys().copied().collect();
-        page_numbers.sort();
+        let page_count = oxide_doc.page_count().unwrap_or(0);
+        if page_count == 0 {
+            return Ok(doc);
+        }
 
-        // Phase 1: Analyze layout and extract text for all pages
+        // Also load with lopdf for path-based table detection
+        let lopdf_doc = lopdf::Document::load_mem(&data).ok();
+        let lopdf_pages: BTreeMap<u32, lopdf::ObjectId> = lopdf_doc
+            .as_ref()
+            .map(|d| d.get_pages())
+            .unwrap_or_default();
+
+        // Phase 1: Extract blocks and collect font sizes for all pages
+        #[allow(dead_code)]
         struct PageData {
             page_num: u32,
+            page_index: usize,
             width: f64,
             height: f64,
-            raw_text: String,
-            layout: Option<LayoutInfo>,
-            column_layout: ColumnLayout,
+            blocks: Vec<AssembledBlock>,
         }
 
         let mut all_pages: Vec<PageData> = Vec::new();
         let mut all_font_sizes: Vec<f64> = Vec::new();
 
-        for &page_num in &page_numbers {
-            let page_id = pages[&page_num];
-            let (width, height) = resolve_page_size(&pdf_doc, page_id).unwrap_or((612.0, 792.0));
+        for page_index in 0..page_count {
+            let page_num = (page_index + 1) as u32;
+            let (width, height) = resolve_page_size_oxide(&mut oxide_doc, page_index);
 
             doc.pages.insert(
                 page_num.to_string(),
@@ -1416,121 +1037,89 @@ impl Backend for PdfBackend {
                 },
             );
 
-            let raw_text = pdf_doc.extract_text(&[page_num]).unwrap_or_default();
-            let layout = analyze_page_layout(&pdf_doc, page_id).ok();
+            let blocks = assemble_page_blocks(&mut oxide_doc, page_index, height);
 
-            let column_layout = if let Some(ref li) = layout {
-                all_font_sizes.extend(li.text_events.iter().map(|e| e.font_size));
-                detect_columns(&li.text_events, width)
-            } else {
-                ColumnLayout::Single
-            };
+            for block in &blocks {
+                if !block.is_artifact {
+                    all_font_sizes.push(block.font_size);
+                }
+            }
 
             all_pages.push(PageData {
                 page_num,
+                page_index,
                 width,
                 height,
-                raw_text,
-                layout,
-                column_layout,
+                blocks,
             });
         }
 
         let body_font_size = median_f64(&all_font_sizes);
 
-        // Phase 2: Detect page headers/footers
-        let page_text_refs: Vec<(u32, &str)> = all_pages
+        // Phase 2: Detect page furniture
+        let page_block_refs: Vec<(u32, Vec<AssembledBlock>)> = all_pages
             .iter()
-            .map(|p| (p.page_num, p.raw_text.as_str()))
+            .map(|p| (p.page_num, p.blocks.clone()))
             .collect();
-        let (header_texts, footer_texts) = detect_page_furniture(&page_text_refs);
+        let (header_texts, footer_texts) = detect_page_furniture_from_blocks(&page_block_refs);
 
-        // Phase 3: Process each page
+        // Phase 3: Classify and emit
         for page_data in &all_pages {
-            let text = sanitize_text(&page_data.raw_text);
-            let text = text.trim();
-            if text.is_empty() {
-                // Still check for images
-                if let Some(ref layout) = page_data.layout {
-                    emit_images(&mut doc, layout, page_data.page_num, page_data.height);
-                }
+            let content_blocks: Vec<&AssembledBlock> = page_data
+                .blocks
+                .iter()
+                .filter(|b| !b.is_artifact)
+                .collect();
+
+            if content_blocks.is_empty() {
+                emit_images_oxide(&mut doc, &mut oxide_doc, page_data.page_index, page_data.page_num, page_data.height);
                 continue;
             }
 
-            // For multi-column pages, use positioned text for reordering
-            let processed_text = match page_data.column_layout {
-                ColumnLayout::TwoColumn { boundary } => {
-                    if let Some(ref layout) = page_data.layout {
-                        if !layout.positioned_texts.is_empty() {
-                            let reordered = reorder_multicolumn_text(
-                                &layout.positioned_texts,
-                                page_data.height,
-                                boundary,
-                            );
-                            sanitize_text(&reordered)
-                        } else {
-                            text.to_string()
-                        }
-                    } else {
-                        text.to_string()
-                    }
-                }
-                ColumnLayout::Single => text.to_string(),
-            };
+            let mut classified: Vec<(&AssembledBlock, DocItemLabel)> = Vec::new();
 
-            // Build font size map for the page
-            let fs_info = page_data
-                .layout
-                .as_ref()
-                .map(|li| analyze_font_sizes(&li.text_events));
-
-            // Pre-classify all paragraphs to enable list grouping
-            let raw_paragraphs = split_paragraphs(&processed_text);
-            let paragraphs = merge_fragment_paragraphs(&raw_paragraphs);
-            let mut classified: Vec<(String, DocItemLabel, Option<f64>)> = Vec::new();
-            let mut para_idx = 0;
-
-            for paragraph in &paragraphs {
-                let trimmed = paragraph.trim();
+            for block in &content_blocks {
+                let text = sanitize_text(&block.text);
+                let trimmed = text.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
 
-                // Skip page headers/footers
                 let is_header = header_texts.iter().any(|h| trimmed.contains(h.as_str()));
                 let is_footer = footer_texts.iter().any(|f| trimmed.contains(f.as_str()));
-                if is_header || is_footer {
-                    if trimmed.len() < 100 {
-                        let label = if is_footer && !is_header {
-                            DocItemLabel::PageFooter
-                        } else {
-                            DocItemLabel::PageHeader
-                        };
-                        doc.add_furniture_text(label, trimmed);
-                        para_idx += 1;
-                        continue;
-                    }
+                if (is_header || is_footer) && trimmed.len() < 100 {
+                    let label = if is_footer && !is_header {
+                        DocItemLabel::PageFooter
+                    } else {
+                        DocItemLabel::PageHeader
+                    };
+                    let fidx = doc.add_furniture_text(label, trimmed);
+                    let (bl, bt, br, bb) = block.bbox;
+                    doc.texts[fidx].prov.push(ProvenanceItem {
+                        page_no: page_data.page_num,
+                        bbox: BoundingBox {
+                            l: bl,
+                            t: bt,
+                            r: br,
+                            b: bb,
+                            coord_origin: Some("TOPLEFT".to_string()),
+                        },
+                        charspan: Some((0, trimmed.len())),
+                    });
+                    continue;
                 }
 
-                let local_fs = fs_info.as_ref().and_then(|info| {
-                    if para_idx < info.sizes_per_event.len() {
-                        Some(info.sizes_per_event[para_idx])
-                    } else {
-                        None
-                    }
-                });
-
-                let label = classify_paragraph(trimmed, body_font_size, local_fs);
-                classified.push((trimmed.to_string(), label, local_fs));
-                para_idx += 1;
+                let label = classify_paragraph(trimmed, body_font_size, Some(block.font_size));
+                classified.push((block, label));
             }
 
-            // Emit classified paragraphs with list grouping
             let mut current_list_group: Option<String> = None;
             let mut i = 0;
             while i < classified.len() {
-                let (ref text, ref label, local_fs) = classified[i];
-                let trimmed = text.as_str();
+                let (block, ref label) = classified[i];
+                let text = sanitize_text(&block.text);
+                let trimmed = text.trim();
+                let (bl, bt, br, bb) = block.bbox;
 
                 if *label == DocItemLabel::ListItem {
                     if current_list_group.is_none() {
@@ -1548,16 +1137,15 @@ impl Backend for PdfBackend {
                     let enumerated = looks_like_numbered_list(trimmed);
                     let marker = extract_list_marker(trimmed);
                     let item_text = strip_list_marker(trimmed);
-                    let idx =
-                        doc.add_list_item(&item_text, enumerated, marker.as_deref(), group_ref);
+                    let idx = doc.add_list_item(&item_text, enumerated, marker.as_deref(), group_ref);
 
                     doc.texts[idx].prov.push(ProvenanceItem {
                         page_no: page_data.page_num,
                         bbox: BoundingBox {
-                            l: 0.0,
-                            t: 0.0,
-                            r: page_data.width,
-                            b: page_data.height,
+                            l: bl,
+                            t: bt,
+                            r: br,
+                            b: bb,
                             coord_origin: Some("TOPLEFT".to_string()),
                         },
                         charspan: Some((0, trimmed.len())),
@@ -1570,19 +1158,17 @@ impl Backend for PdfBackend {
                     doc.texts[idx].prov.push(ProvenanceItem {
                         page_no: page_data.page_num,
                         bbox: BoundingBox {
-                            l: 0.0,
-                            t: 0.0,
-                            r: page_data.width,
-                            b: page_data.height,
+                            l: bl,
+                            t: bt,
+                            r: br,
+                            b: bb,
                             coord_origin: Some("TOPLEFT".to_string()),
                         },
                         charspan: Some((0, trimmed.len())),
                     });
 
                     if *label == DocItemLabel::SectionHeader {
-                        let size_ratio = local_fs
-                            .map(|fs| fs / body_font_size)
-                            .unwrap_or(1.5);
+                        let size_ratio = block.font_size / body_font_size;
                         let level = guess_heading_level(trimmed, size_ratio);
                         doc.texts[idx].level = Some(level);
                     }
@@ -1591,209 +1177,73 @@ impl Backend for PdfBackend {
                 i += 1;
             }
 
-            // Emit tables from ruled lines
-            if let Some(ref layout) = page_data.layout {
-                let table_regions = detect_table_regions(&layout.paths, page_data.height);
-                for region in &table_regions {
-                    if let Some((grid, num_rows, num_cols)) =
-                        build_table_from_texts(&layout.positioned_texts, region, page_data.height)
-                    {
-                        // Filter out false positives: require at least 40% non-empty cells
-                        // and at least 2 columns with content
-                        let total_cells = num_rows * num_cols;
-                        let non_empty = grid.iter()
-                            .flat_map(|row| row.iter())
-                            .filter(|c| !c.trim().is_empty())
-                            .count();
-                        if total_cells == 0 || (non_empty as f64 / total_cells as f64) < 0.35 {
-                            continue;
-                        }
-                        let cols_with_content: usize = (0..num_cols)
-                            .filter(|&c| grid.iter().any(|row| !row[c].trim().is_empty()))
-                            .count();
-                        if cols_with_content < 2 {
-                            continue;
-                        }
-
-                        let mut cells = Vec::new();
-                        for r in 0..num_rows {
-                            for c in 0..num_cols {
-                                cells.push(TableCell {
-                                    text: grid[r][c].clone(),
-                                    start_row_offset_idx: r as u32,
-                                    end_row_offset_idx: (r + 1) as u32,
-                                    start_col_offset_idx: c as u32,
-                                    end_col_offset_idx: (c + 1) as u32,
-                                    row_span: 1,
-                                    col_span: 1,
-                                    column_header: r == 0,
-                                    row_header: false,
-                                    row_section: false,
-                                    fillable: false,
-                                    formatted_text: None,
-                                });
+            // Emit tables from lopdf path segments
+            if let Some(ref lopdf_doc) = lopdf_doc {
+                let lopdf_page_num = page_data.page_num;
+                if let Some(&page_id) = lopdf_pages.get(&lopdf_page_num) {
+                    let paths = extract_paths_from_page(lopdf_doc, page_id);
+                    let table_regions = detect_table_regions(&paths, page_data.height);
+                    for region in &table_regions {
+                        if let Some((grid, num_rows, num_cols)) =
+                            build_table_from_blocks(&page_data.blocks, region)
+                        {
+                            let total_cells = num_rows * num_cols;
+                            let non_empty = grid.iter()
+                                .flat_map(|row| row.iter())
+                                .filter(|c| !c.trim().is_empty())
+                                .count();
+                            if total_cells == 0 || (non_empty as f64 / total_cells as f64) < 0.35 {
+                                continue;
                             }
-                        }
+                            let cols_with_content: usize = (0..num_cols)
+                                .filter(|&c| grid.iter().any(|row| !row[c].trim().is_empty()))
+                                .count();
+                            if cols_with_content < 2 {
+                                continue;
+                            }
 
-                        let table_idx = doc.add_table(
-                            cells,
-                            num_rows as u32,
-                            num_cols as u32,
-                            None,
-                        );
-                        doc.tables[table_idx].prov.push(ProvenanceItem {
-                            page_no: page_data.page_num,
-                            bbox: BoundingBox {
-                                l: region.x_min,
-                                t: region.y_min,
-                                r: region.x_max,
-                                b: region.y_max,
-                                coord_origin: Some("TOPLEFT".to_string()),
-                            },
-                            charspan: None,
-                        });
+                            let mut cells = Vec::new();
+                            for r in 0..num_rows {
+                                for c in 0..num_cols {
+                                    cells.push(TableCell {
+                                        text: grid[r][c].clone(),
+                                        start_row_offset_idx: r as u32,
+                                        end_row_offset_idx: (r + 1) as u32,
+                                        start_col_offset_idx: c as u32,
+                                        end_col_offset_idx: (c + 1) as u32,
+                                        row_span: 1,
+                                        col_span: 1,
+                                        column_header: r == 0,
+                                        row_header: false,
+                                        row_section: false,
+                                        fillable: false,
+                                        formatted_text: None,
+                                    });
+                                }
+                            }
+
+                            let table_idx = doc.add_table(cells, num_rows as u32, num_cols as u32, None);
+                            doc.tables[table_idx].prov.push(ProvenanceItem {
+                                page_no: page_data.page_num,
+                                bbox: BoundingBox {
+                                    l: region.x_min,
+                                    t: region.y_min,
+                                    r: region.x_max,
+                                    b: region.y_max,
+                                    coord_origin: Some("TOPLEFT".to_string()),
+                                },
+                                charspan: None,
+                            });
+                        }
                     }
                 }
-
-                // Emit images
-                emit_images(&mut doc, layout, page_data.page_num, page_data.height);
             }
+
+            // Emit images
+            emit_images_oxide(&mut doc, &mut oxide_doc, page_data.page_index, page_data.page_num, page_data.height);
         }
 
         Ok(doc)
-    }
-}
-
-fn extract_image_bytes(
-    pdf_doc: &Document,
-    stream: &lopdf::Stream,
-    obj_id: ObjectId,
-) -> (Option<Vec<u8>>, Option<String>) {
-    let dict = &stream.dict;
-
-    let filter = dict
-        .get(b"Filter")
-        .ok()
-        .and_then(|f| f.as_name().ok())
-        .unwrap_or(b"");
-
-    if filter == b"DCTDecode" {
-        // JPEG: raw stream bytes are a valid JPEG
-        let bytes = stream.content.clone();
-        if !bytes.is_empty() {
-            return (Some(bytes), Some("image/jpeg".to_string()));
-        }
-    }
-
-    if filter == b"FlateDecode" || filter == b"" {
-        if let Ok(mut owned_stream) = pdf_doc.get_object(obj_id).and_then(|o| {
-            o.as_stream()
-                .map(|s| s.clone())
-                .map_err(|e| lopdf::Error::from(e))
-        }) {
-            let _ = owned_stream.decompress();
-            let raw = &owned_stream.content;
-            let img_width = dict
-                .get(b"Width")
-                .ok()
-                .and_then(|o| o.as_i64().ok())
-                .unwrap_or(0) as u32;
-            let img_height = dict
-                .get(b"Height")
-                .ok()
-                .and_then(|o| o.as_i64().ok())
-                .unwrap_or(0) as u32;
-            let bpc = dict
-                .get(b"BitsPerComponent")
-                .ok()
-                .and_then(|o| o.as_i64().ok())
-                .unwrap_or(8) as u32;
-
-            if img_width > 0 && img_height > 0 && bpc == 8 {
-                let cs = dict
-                    .get(b"ColorSpace")
-                    .ok()
-                    .and_then(|o| o.as_name().ok())
-                    .unwrap_or(b"DeviceRGB");
-                let channels: u32 = if cs == b"DeviceGray" { 1 } else { 3 };
-                let expected = (img_width * img_height * channels) as usize;
-
-                if raw.len() >= expected {
-                    let png_bytes = encode_raw_as_png(raw, img_width, img_height, channels);
-                    if let Some(bytes) = png_bytes {
-                        return (Some(bytes), Some("image/png".to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    if filter == b"JPXDecode" {
-        let bytes = stream.content.clone();
-        if !bytes.is_empty() {
-            return (Some(bytes), Some("image/jp2".to_string()));
-        }
-    }
-
-    (None, None)
-}
-
-fn encode_raw_as_png(raw: &[u8], width: u32, height: u32, channels: u32) -> Option<Vec<u8>> {
-    use image::{DynamicImage, GrayImage, RgbImage};
-    use std::io::Cursor;
-
-    let img: DynamicImage = if channels == 1 {
-        let buf = GrayImage::from_raw(width, height, raw[..(width * height) as usize].to_vec())?;
-        DynamicImage::ImageLuma8(buf)
-    } else {
-        let buf = RgbImage::from_raw(
-            width,
-            height,
-            raw[..(width * height * 3) as usize].to_vec(),
-        )?;
-        DynamicImage::ImageRgb8(buf)
-    };
-
-    let mut png_buf = Cursor::new(Vec::new());
-    img.write_to(&mut png_buf, image::ImageFormat::Png).ok()?;
-    Some(png_buf.into_inner())
-}
-
-fn emit_images(doc: &mut DoclingDocument, layout: &LayoutInfo, page_num: u32, page_height: f64) {
-    for img in &layout.images {
-        let img_y_top = page_height - img.y;
-        let idx = doc.add_picture(None, None);
-        doc.pictures[idx].prov.push(ProvenanceItem {
-            page_no: page_num,
-            bbox: BoundingBox {
-                l: img.x,
-                t: img_y_top,
-                r: img.x + img.width,
-                b: img_y_top + img.height,
-                coord_origin: Some("TOPLEFT".to_string()),
-            },
-            charspan: None,
-        });
-
-        if let (Some(ref data), Some(ref mimetype)) = (&img.data, &img.mimetype) {
-            let (px_w, px_h) = image::load_from_memory(data)
-                .map(|i| (i.width() as f64, i.height() as f64))
-                .unwrap_or((img.width, img.height));
-            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-            let uri = format!("data:{};base64,{}", mimetype, b64);
-            doc.set_picture_image(
-                idx,
-                ImageRef {
-                    mimetype: mimetype.clone(),
-                    dpi: 72,
-                    size: ImageSize {
-                        width: px_w,
-                        height: px_h,
-                    },
-                    uri,
-                },
-            );
-        }
     }
 }
 
@@ -1806,29 +1256,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_split_paragraphs_double_newline() {
-        let text = "Hello world\n\nSecond paragraph";
-        let result = split_paragraphs(text);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], "Hello world");
-        assert_eq!(result[1], "Second paragraph");
-    }
-
-    #[test]
-    fn test_split_paragraphs_empty() {
-        let text = "  \n\n  ";
-        let result = split_paragraphs(text);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_split_paragraphs_single_block() {
-        let text = "One long paragraph that wraps across\nmultiple lines but is really\njust one paragraph.";
-        let result = split_paragraphs(text);
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
     fn test_looks_like_section_header() {
         assert!(looks_like_section_header("1 Introduction"));
         assert!(looks_like_section_header("1.2 Methods"));
@@ -1838,7 +1265,6 @@ mod tests {
         assert!(looks_like_section_header("Part II"));
         assert!(looks_like_section_header("Section 1.2 Overview"));
         assert!(looks_like_section_header("Appendix A"));
-        // Pure content words are NOT structural headers without numbering
         assert!(!looks_like_section_header("References"));
         assert!(!looks_like_section_header("Abstract"));
         assert!(!looks_like_section_header("Introduction"));
@@ -1866,17 +1292,14 @@ mod tests {
 
     #[test]
     fn test_guess_heading_level() {
-        // Numbered sections derive level from numbering depth
         assert_eq!(guess_heading_level("1 Introduction", 1.5), 1);
         assert_eq!(guess_heading_level("1.2 Sub-section", 1.5), 2);
         assert_eq!(guess_heading_level("1.2.3 Deep", 1.5), 3);
-        // Letter-number sections
         assert_eq!(guess_heading_level("A Overview", 1.5), 1);
         assert_eq!(guess_heading_level("A.1 Details", 1.5), 2);
-        // Non-numbered headings fall back to font-size ratio
-        assert_eq!(guess_heading_level("Abstract", 1.5), 2); // ratio 1.5 → level 2
-        assert_eq!(guess_heading_level("Abstract", 1.8), 1); // ratio 1.8 → level 1
-        assert_eq!(guess_heading_level("Abstract", 1.2), 3); // ratio 1.2 → level 3
+        assert_eq!(guess_heading_level("Abstract", 1.5), 2);
+        assert_eq!(guess_heading_level("Abstract", 1.8), 1);
+        assert_eq!(guess_heading_level("Abstract", 1.2), 3);
     }
 
     #[test]
@@ -1897,10 +1320,10 @@ mod tests {
 
     #[test]
     fn test_obj_as_f64() {
-        assert_eq!(obj_as_f64(&Object::Integer(42)), Some(42.0));
-        let real_val = obj_as_f64(&Object::Real(3.14)).unwrap();
+        assert_eq!(obj_as_f64(&lopdf::Object::Integer(42)), Some(42.0));
+        let real_val = obj_as_f64(&lopdf::Object::Real(3.14)).unwrap();
         assert!((real_val - 3.14).abs() < 0.001);
-        assert!(obj_as_f64(&Object::Boolean(true)).is_none());
+        assert!(obj_as_f64(&lopdf::Object::Boolean(true)).is_none());
     }
 
     #[test]

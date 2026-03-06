@@ -32,8 +32,13 @@ chrono = "0.4"
 quick-xml = "0.39.2"
 roxmltree = "0.21.1"
 lopdf = "0.39.0"
+pdf_oxide = { version = "=0.3.15", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff", "webp"] }
 base64 = "0.22"
+
+[features]
+default = ["pdf-oxide"]
+pdf-oxide = ["dep:pdf_oxide"]
 
 [dev-dependencies]
 assert_cmd = "2"
