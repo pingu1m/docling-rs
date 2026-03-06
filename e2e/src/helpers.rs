@@ -13,7 +13,9 @@ pub fn docling_bin() -> PathBuf {
     base.push("docling-rs");
 
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        let release = PathBuf::from(&target_dir).join("release").join("docling-rs");
+        let release = PathBuf::from(&target_dir)
+            .join("release")
+            .join("docling-rs");
         if release.exists() {
             return release;
         }
@@ -51,10 +53,7 @@ pub fn run_convert(input: &Path, formats: &[&str]) -> ConvertResult {
     let bin = docling_bin();
 
     let mut cmd = Command::new(&bin);
-    cmd.arg("convert")
-        .arg(input)
-        .arg("-o")
-        .arg(tmp.path());
+    cmd.arg("convert").arg(input).arg("-o").arg(tmp.path());
 
     for fmt in formats {
         cmd.arg("--to").arg(fmt);
@@ -70,7 +69,11 @@ pub fn run_convert(input: &Path, formats: &[&str]) -> ConvertResult {
     }
 }
 
-pub fn run_convert_with_format(input: &Path, formats: &[&str], input_format: &str) -> ConvertResult {
+pub fn run_convert_with_format(
+    input: &Path,
+    formats: &[&str],
+    input_format: &str,
+) -> ConvertResult {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let bin = docling_bin();
 
@@ -302,8 +305,14 @@ pub fn assert_json_strict_structural_match(actual: &str, expected: &str) {
     }
 
     // Verify body children (check both have children, allow structural differences)
-    let actual_body = actual_val.get("body").and_then(|v| v.get("children")).and_then(|v| v.as_array());
-    let expected_body = expected_val.get("body").and_then(|v| v.get("children")).and_then(|v| v.as_array());
+    let actual_body = actual_val
+        .get("body")
+        .and_then(|v| v.get("children"))
+        .and_then(|v| v.as_array());
+    let expected_body = expected_val
+        .get("body")
+        .and_then(|v| v.get("children"))
+        .and_then(|v| v.as_array());
     if let (Some(ab), Some(eb)) = (actual_body, expected_body) {
         assert!(
             !ab.is_empty() || eb.is_empty(),
@@ -359,7 +368,11 @@ pub fn assert_json_lenient_structural_match(actual: &str, expected: &str) {
     ) {
         let an_base = an.split('.').next().unwrap_or(an);
         let en_base = en.split('.').next().unwrap_or(en);
-        assert_eq!(an_base, en_base, "name base mismatch: actual={}, expected={}", an, en);
+        assert_eq!(
+            an_base, en_base,
+            "name base mismatch: actual={}, expected={}",
+            an, en
+        );
     }
 
     let actual_texts = actual_val.get("texts").and_then(|v| v.as_array());
@@ -413,13 +426,21 @@ pub fn assert_valid_docling_document(json: &str) {
             .and_then(|v| v.as_str())
             .expect("body child must have a $ref");
         let valid = if let Some(rest) = ref_str.strip_prefix("#/texts/") {
-            rest.parse::<usize>().map(|i| i < texts_len).unwrap_or(false)
+            rest.parse::<usize>()
+                .map(|i| i < texts_len)
+                .unwrap_or(false)
         } else if let Some(rest) = ref_str.strip_prefix("#/tables/") {
-            rest.parse::<usize>().map(|i| i < tables_len).unwrap_or(false)
+            rest.parse::<usize>()
+                .map(|i| i < tables_len)
+                .unwrap_or(false)
         } else if let Some(rest) = ref_str.strip_prefix("#/groups/") {
-            rest.parse::<usize>().map(|i| i < groups_len).unwrap_or(false)
+            rest.parse::<usize>()
+                .map(|i| i < groups_len)
+                .unwrap_or(false)
         } else if let Some(rest) = ref_str.strip_prefix("#/pictures/") {
-            rest.parse::<usize>().map(|i| i < pictures_len).unwrap_or(false)
+            rest.parse::<usize>()
+                .map(|i| i < pictures_len)
+                .unwrap_or(false)
         } else {
             false
         };
@@ -437,7 +458,11 @@ fn normalize_refs(val: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(map) => {
             let mut new_map = serde_json::Map::new();
             for (k, v) in map {
-                let key = if k == "cref" { "$ref".to_string() } else { k.clone() };
+                let key = if k == "cref" {
+                    "$ref".to_string()
+                } else {
+                    k.clone()
+                };
                 new_map.insert(key, normalize_refs(v));
             }
             serde_json::Value::Object(new_map)
