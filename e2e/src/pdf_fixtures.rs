@@ -58,12 +58,12 @@ impl PdfBuilder {
         let xref_offset = buf.len();
         let max_id = self.next_id;
         write!(buf, "xref\n0 {max_id}\n").unwrap();
-        write!(buf, "0000000000 65535 f \n").unwrap();
+        writeln!(buf, "0000000000 65535 f ").unwrap();
 
         let mut sorted = offsets.clone();
         sorted.sort_by_key(|(id, _)| *id);
         for (_, offset) in &sorted {
-            write!(buf, "{offset:010} 00000 n \n").unwrap();
+            writeln!(buf, "{offset:010} 00000 n ").unwrap();
         }
 
         write!(

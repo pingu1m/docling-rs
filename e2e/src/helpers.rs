@@ -4,6 +4,12 @@ use std::process::Command;
 use tempfile::TempDir;
 
 pub fn docling_bin() -> PathBuf {
+    let bin_name = if cfg!(windows) {
+        "docling-rs.exe"
+    } else {
+        "docling-rs"
+    };
+
     if let Ok(p) = std::env::var("DOCLING_BIN") {
         return PathBuf::from(p);
     }
@@ -13,20 +19,18 @@ pub fn docling_bin() -> PathBuf {
     base.push("docling-rs");
 
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        let release = PathBuf::from(&target_dir)
-            .join("release")
-            .join("docling-rs");
+        let release = PathBuf::from(&target_dir).join("release").join(bin_name);
         if release.exists() {
             return release;
         }
-        return PathBuf::from(&target_dir).join("debug").join("docling-rs");
+        return PathBuf::from(&target_dir).join("debug").join(bin_name);
     }
 
-    let release = base.join("target").join("release").join("docling-rs");
+    let release = base.join("target").join("release").join(bin_name);
     if release.exists() {
         return release;
     }
-    base.join("target").join("debug").join("docling-rs")
+    base.join("target").join("debug").join(bin_name)
 }
 
 pub fn test_data_dir() -> PathBuf {
@@ -453,6 +457,7 @@ pub fn assert_valid_docling_document(json: &str) {
 }
 
 /// Normalize Python's `cref` keys to `$ref` for comparison with Rust output.
+#[allow(dead_code)]
 fn normalize_refs(val: &serde_json::Value) -> serde_json::Value {
     match val {
         serde_json::Value::Object(map) => {
