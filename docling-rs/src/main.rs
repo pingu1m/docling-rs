@@ -107,6 +107,7 @@ fn convert_one(
 
     if image_mode == ImageRefMode::Referenced {
         materialize_images(&mut doc, output_dir)?;
+        resolve_table_image_refs(&mut doc);
     }
 
     let stem = &doc.name;
@@ -332,6 +333,71 @@ fn materialize_images(
 
     log::info!("  Kept {} images after filtering/deduplication", kept_count);
     Ok(())
+}
+
+/// After materialization, resolve `<!-- image -->` placeholders in table cells
+/// with actual `![Image](path)` references by tracing group parentage.
+fn resolve_table_image_refs(doc: &mut docling::models::document::DoclingDocument) {
+    // Build map: group_ref -> Vec<picture URI> for pictures with materialized URIs
+    let mut group_pics: HashMap<String, Vec<String>> = HashMap::new();
+    for pic in &doc.pictures {
+        if let Some(ref parent) = pic.parent {
+            if let Some(ref img) = pic.image {
+                if !img.uri.is_empty()
+                    && !img.uri.starts_with("data:")
+                    && !img.uri.starts_with("[IMAGE OMITTED")
+                {
+                    group_pics
+                        .entry(parent.ref_path.clone())
+                        .or_default()
+                        .push(img.uri.clone());
+                }
+            }
+        }
+    }
+
+    // Map: (table_idx, row, col) -> Vec<image URI> using group names
+    let mut cell_images: HashMap<(usize, u32, u32), Vec<String>> = HashMap::new();
+    for (gidx, group) in doc.groups.iter().enumerate() {
+        let gref = format!("#/groups/{}", gidx);
+        if let Some(uris) = group_pics.get(&gref) {
+            if let Some(rest) = group.name.strip_prefix("rich_cell_group_") {
+                let parts: Vec<&str> = rest.splitn(3, '_').collect();
+                if parts.len() == 3 {
+                    if let (Ok(tidx_1based), Ok(row), Ok(col)) = (
+                        parts[0].parse::<usize>(),
+                        parts[1].parse::<u32>(),
+                        parts[2].parse::<u32>(),
+                    ) {
+                        cell_images
+                            .entry((tidx_1based - 1, row, col))
+                            .or_default()
+                            .extend(uris.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+
+    // Replace <!-- image --> in table cells with actual image markdown
+    for ((tidx, row, col), uris) in &cell_images {
+        if let Some(table) = doc.tables.get_mut(*tidx) {
+            for cell in &mut table.data.table_cells {
+                if cell.start_row_offset_idx == *row && cell.start_col_offset_idx == *col {
+                    let img_md: String = uris
+                        .iter()
+                        .map(|uri| format!("![Image]({})", uri))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if let Some(ref mut fmt) = cell.formatted_text {
+                        *fmt = fmt.replace("<!-- image -->", &img_md);
+                    }
+                    cell.text = cell.text.replace("<!-- image -->", &img_md);
+                }
+            }
+            table.data.build_grid();
+        }
+    }
 }
 
 /// Export each sheet in an XLSX file as a separate CSV file.
