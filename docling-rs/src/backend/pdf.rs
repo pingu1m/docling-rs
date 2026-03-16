@@ -1948,7 +1948,26 @@ impl Backend for PdfBackend {
                     if any_text {
                         return Ok(doc);
                     }
-                    log::warn!("pdfium also returned no text; continuing with empty document");
+                    // No text at all — render each page as an image (scanned/image-only PDF)
+                    log::info!("pdfium also returned no text; rendering pages as images");
+                    let mut seen_image_hashes: HashSet<u64> = HashSet::new();
+                    for page_idx in 0..pdfium_page_count {
+                        if let Ok(page) = pdfium_doc.pages().get(page_idx as u16) {
+                            let pw = page.width().value as f64;
+                            let ph = page.height().value as f64;
+                            emit_full_page_render(
+                                &mut doc,
+                                pdfium,
+                                &data,
+                                page_idx as usize,
+                                (page_idx + 1) as u32,
+                                pw,
+                                ph,
+                                &mut seen_image_hashes,
+                            );
+                        }
+                    }
+                    return Ok(doc);
                 } else {
                     log::warn!("pdfium failed to load PDF document");
                 }
