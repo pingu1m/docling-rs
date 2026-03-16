@@ -145,4 +145,8 @@ pub struct ConvertArgs {
     /// Image export mode
     #[arg(long = "image-export-mode")]
     pub image_export_mode: Option<CliImageRefMode>,
+
+    /// Disable OCR for image-based PDFs (faster but no text extraction)
+    #[arg(long = "no-ocr")]
+    pub no_ocr: bool,
 }

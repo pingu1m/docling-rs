@@ -1,6 +1,6 @@
 [package]
 name = "docling-rs"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 
 [[bin]]
@@ -37,11 +37,13 @@ pdfium-render = { version = "0.8", optional = true }
 pdfium-auto = { version = "0.1", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff", "webp"] }
 base64 = "0.22"
+rusty-tesseract = { version = "1.1", optional = true }
 
 [features]
-default = ["pdf-oxide", "pdfium-render"]
+default = ["pdf-oxide", "pdfium-render", "ocr"]
 pdf-oxide = ["dep:pdf_oxide"]
 pdfium-render = ["dep:pdfium-render", "dep:pdfium-auto"]
+ocr = ["dep:rusty-tesseract"]
 
 [dev-dependencies]
 assert_cmd = "2"

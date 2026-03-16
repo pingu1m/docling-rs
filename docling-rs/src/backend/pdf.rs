@@ -1948,24 +1948,73 @@ impl Backend for PdfBackend {
                     if any_text {
                         return Ok(doc);
                     }
-                    // No text at all — render each page as an image (scanned/image-only PDF)
-                    log::info!("pdfium also returned no text; rendering pages as images");
+                    // No text at all — try OCR on rendered pages
+                    log::info!("pdfium also returned no text; attempting OCR");
                     let mut seen_image_hashes: HashSet<u64> = HashSet::new();
+                    let mut ocr_any_text = false;
+                    
                     for page_idx in 0..pdfium_page_count {
                         if let Ok(page) = pdfium_doc.pages().get(page_idx as u16) {
+                            let page_num = (page_idx + 1) as u32;
                             let pw = page.width().value as f64;
                             let ph = page.height().value as f64;
-                            emit_full_page_render(
-                                &mut doc,
-                                pdfium,
-                                &data,
-                                page_idx as usize,
-                                (page_idx + 1) as u32,
-                                pw,
-                                ph,
-                                &mut seen_image_hashes,
-                            );
+                            
+                            // Render page at 200 DPI for OCR
+                            let render_dpi: f64 = 200.0;
+                            let scale = render_dpi / 72.0;
+                            let full_w = (pw * scale).round() as i32;
+                            
+                            let config = pdfium_render::prelude::PdfRenderConfig::new()
+                                .set_target_width(full_w)
+                                .set_maximum_height(full_w * 4);
+                            
+                            if let Ok(bitmap) = page.render_with_config(&config) {
+                                let page_image: image::DynamicImage = bitmap.as_image();
+                                
+                                // Try OCR on the rendered page
+                                if let Some(ocr_text) = crate::ocr::ocr_image_to_text(&page_image) {
+                                    ocr_any_text = true;
+                                    log::info!("OCR extracted {} chars from page {}", ocr_text.len(), page_num);
+                                    
+                                    // Add OCR text as paragraphs
+                                    for paragraph in ocr_text.split("\n\n") {
+                                        let para = paragraph.trim();
+                                        if para.is_empty() {
+                                            continue;
+                                        }
+                                        let label = classify_paragraph(para, 12.0, None);
+                                        match label {
+                                            DocItemLabel::Title => {
+                                                doc.add_title(para, None);
+                                            }
+                                            DocItemLabel::SectionHeader => {
+                                                doc.add_section_header(para, 1, None);
+                                            }
+                                            _ => {
+                                                doc.add_text(label, para, None);
+                                            }
+                                        }
+                                    }
+                                    // OCR succeeded - don't add page image since we have the text
+                                } else {
+                                    // OCR failed for this page - add page image as fallback
+                                    emit_full_page_render(
+                                        &mut doc,
+                                        pdfium,
+                                        &data,
+                                        page_idx as usize,
+                                        page_num,
+                                        pw,
+                                        ph,
+                                        &mut seen_image_hashes,
+                                    );
+                                }
+                            }
                         }
+                    }
+                    
+                    if !ocr_any_text {
+                        log::warn!("OCR did not extract any text (Tesseract may not be installed)");
                     }
                     return Ok(doc);
                 } else {

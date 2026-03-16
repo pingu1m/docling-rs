@@ -46,6 +46,11 @@ fn main() -> anyhow::Result<()> {
                     .init(),
             }
 
+            // Set OCR flag via environment variable (checked by ocr module)
+            if args.no_ocr {
+                std::env::set_var("DOCLING_OCR", "0");
+            }
+
             let converter = DocumentConverter::new();
             let output_dir = &args.output;
             fs::create_dir_all(output_dir)?;
