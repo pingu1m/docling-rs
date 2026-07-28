@@ -854,7 +854,9 @@ fn starts_with_bullet(text: &str) -> bool {
             let rest = &text[first.len_utf8()..];
             return rest.starts_with(' ') || rest.is_empty();
         }
-        if (first == '-' || first == '–' || first == '—') && text.len() > 2 {
+        if (first == '-' || first == '–' || first == '—' || first == '+' || first == '*')
+            && text.len() > 2
+        {
             return text[first.len_utf8()..].starts_with(' ');
         }
     }
@@ -899,7 +901,13 @@ fn extract_list_marker(text: &str) -> Option<String> {
     let trimmed = text.trim();
 
     if let Some(first) = trimmed.chars().next() {
-        if BULLET_GLYPHS.contains(&first) || first == '-' || first == '–' || first == '—' {
+        if BULLET_GLYPHS.contains(&first)
+            || first == '-'
+            || first == '–'
+            || first == '—'
+            || first == '+'
+            || first == '*'
+        {
             let rest = &trimmed[first.len_utf8()..];
             if rest.starts_with(' ') || rest.is_empty() {
                 return Some(first.to_string());
@@ -918,7 +926,13 @@ fn strip_list_marker(text: &str) -> String {
     let trimmed = text.trim();
 
     if let Some(first) = trimmed.chars().next() {
-        if BULLET_GLYPHS.contains(&first) || first == '-' || first == '–' || first == '—' {
+        if BULLET_GLYPHS.contains(&first)
+            || first == '-'
+            || first == '–'
+            || first == '—'
+            || first == '+'
+            || first == '*'
+        {
             let rest = &trimmed[first.len_utf8()..];
             if let Some(stripped) = rest.strip_prefix(' ') {
                 return stripped.trim_start().to_string();
@@ -1070,6 +1084,202 @@ fn resolve_array(doc: &lopdf::Document, obj: &lopdf::Object) -> Option<Vec<lopdf
             .and_then(|o| o.as_array().ok().cloned()),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// OCR layout analysis (column detection, table detection, noise filtering)
+// ---------------------------------------------------------------------------
+
+use crate::ocr::OcrBlock;
+
+/// Reorder OCR blocks into proper reading order by detecting columns.
+/// Returns blocks sorted: left column top-to-bottom, then right column top-to-bottom.
+/// For single-column layouts, returns blocks sorted top-to-bottom.
+fn ocr_reading_order(blocks: &mut [OcrBlock], page_width: i32) {
+    if blocks.len() < 2 || page_width <= 0 {
+        blocks.sort_by(|a, b| a.bbox.1.cmp(&b.bbox.1));
+        return;
+    }
+
+    let page_mid = page_width / 2;
+    let gap_threshold = page_width as f64 * 0.15;
+
+    let mut left_centers: Vec<f64> = Vec::new();
+    let mut right_centers: Vec<f64> = Vec::new();
+    for b in blocks.iter() {
+        let cx = b.bbox.0 as f64 + b.bbox.2 as f64 / 2.0;
+        if cx < page_mid as f64 {
+            left_centers.push(cx);
+        } else {
+            right_centers.push(cx);
+        }
+    }
+
+    let is_two_column = left_centers.len() >= 3 && right_centers.len() >= 3 && {
+        let left_max = left_centers
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let right_min = right_centers
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        (right_min - left_max) > gap_threshold
+    };
+
+    if is_two_column {
+        blocks.sort_by(|a, b| {
+            let a_cx = a.bbox.0 as f64 + a.bbox.2 as f64 / 2.0;
+            let b_cx = b.bbox.0 as f64 + b.bbox.2 as f64 / 2.0;
+            let a_col = if a_cx < page_mid as f64 { 0 } else { 1 };
+            let b_col = if b_cx < page_mid as f64 { 0 } else { 1 };
+            a_col.cmp(&b_col).then(a.bbox.1.cmp(&b.bbox.1))
+        });
+    } else {
+        blocks.sort_by(|a, b| a.bbox.1.cmp(&b.bbox.1));
+    }
+}
+
+/// Filter out OCR noise blocks: low confidence, tiny fragments, diagram label overlap.
+fn ocr_filter_noise(blocks: &[OcrBlock]) -> Vec<usize> {
+    let mut keep = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let text = block.text();
+        let trimmed = text.trim();
+
+        if trimmed.len() < 3 {
+            continue;
+        }
+        if block.median_confidence < 25.0 {
+            continue;
+        }
+        if block.low_confidence_word_ratio() > 0.6 {
+            continue;
+        }
+        keep.push(i);
+    }
+    keep
+}
+
+/// Represents a table detected from OCR block spatial alignment.
+struct OcrTableDetection {
+    rows: Vec<Vec<usize>>, // each row is a list of block indices
+    col_count: usize,
+    block_indices: Vec<usize>, // all block indices consumed by this table
+}
+
+/// Detect table structures from OCR blocks using spatial alignment.
+/// Groups blocks into rows by Y-overlap, then finds consecutive row groups
+/// with consistent column counts.
+fn detect_ocr_tables(blocks: &[OcrBlock], page_width: i32) -> Vec<OcrTableDetection> {
+    if blocks.len() < 4 || page_width <= 0 {
+        return Vec::new();
+    }
+
+    // Group blocks into "rows" by Y-overlap: blocks whose vertical ranges overlap
+    // by more than 50% of the shorter block's height.
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut assigned: Vec<bool> = vec![false; blocks.len()];
+
+    // Sort block indices by top position
+    let mut sorted_indices: Vec<usize> = (0..blocks.len()).collect();
+    sorted_indices.sort_by_key(|&i| blocks[i].bbox.1);
+
+    for &idx in &sorted_indices {
+        if assigned[idx] {
+            continue;
+        }
+        let b = &blocks[idx];
+        let b_top = b.bbox.1;
+        let b_bot = b.bbox.1 + b.bbox.3;
+        let b_h = b.bbox.3.max(1);
+
+        let mut row = vec![idx];
+        assigned[idx] = true;
+
+        for &other_idx in &sorted_indices {
+            if assigned[other_idx] || other_idx == idx {
+                continue;
+            }
+            let o = &blocks[other_idx];
+            let o_top = o.bbox.1;
+            let o_bot = o.bbox.1 + o.bbox.3;
+            let o_h = o.bbox.3.max(1);
+
+            let overlap_top = b_top.max(o_top);
+            let overlap_bot = b_bot.min(o_bot);
+            let overlap = (overlap_bot - overlap_top).max(0);
+            let shorter = b_h.min(o_h);
+
+            if overlap as f64 / shorter as f64 > 0.3 {
+                row.push(other_idx);
+                assigned[other_idx] = true;
+            }
+        }
+
+        // Sort row blocks left-to-right
+        row.sort_by_key(|&i| blocks[i].bbox.0);
+        rows.push(row);
+    }
+
+    // Sort rows by their top Y position
+    rows.sort_by_key(|row| {
+        row.iter().map(|&i| blocks[i].bbox.1).min().unwrap_or(0)
+    });
+
+    // Find consecutive runs of rows with the same column count (>= 2)
+    let mut tables: Vec<OcrTableDetection> = Vec::new();
+    let mut run_start = 0;
+
+    while run_start < rows.len() {
+        let col_count = rows[run_start].len();
+        if col_count < 2 {
+            run_start += 1;
+            continue;
+        }
+
+        let mut run_end = run_start + 1;
+        while run_end < rows.len() && rows[run_end].len() == col_count {
+            run_end += 1;
+        }
+
+        let run_len = run_end - run_start;
+        if run_len >= 2 {
+            // Verify column alignment: the X positions of blocks in each column
+            // should be roughly consistent across rows.
+            let first_row_xs: Vec<i32> = rows[run_start]
+                .iter()
+                .map(|&i| blocks[i].bbox.0)
+                .collect();
+
+            let aligned = (run_start + 1..run_end).all(|r| {
+                rows[r].iter().enumerate().all(|(c, &bi)| {
+                    let diff = (blocks[bi].bbox.0 - first_row_xs[c]).abs();
+                    diff < page_width / 4
+                })
+            });
+
+            if aligned {
+                let mut block_indices = Vec::new();
+                let table_rows: Vec<Vec<usize>> = (run_start..run_end)
+                    .map(|r| {
+                        block_indices.extend_from_slice(&rows[r]);
+                        rows[r].clone()
+                    })
+                    .collect();
+
+                tables.push(OcrTableDetection {
+                    rows: table_rows,
+                    col_count,
+                    block_indices,
+                });
+            }
+        }
+
+        run_start = run_end;
+    }
+
+    tables
 }
 
 // ---------------------------------------------------------------------------
@@ -1948,71 +2158,159 @@ impl Backend for PdfBackend {
                     if any_text {
                         return Ok(doc);
                     }
-                    // No text at all — try OCR on rendered pages
-                    log::info!("pdfium also returned no text; attempting OCR");
+                    // No text at all — structured OCR pipeline on rendered pages
+                    log::info!("pdfium also returned no text; attempting structured OCR");
                     let mut seen_image_hashes: HashSet<u64> = HashSet::new();
                     let mut ocr_any_text = false;
-                    
+                    let ocr_dpi: u32 = std::env::var("DOCLING_OCR_DPI")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(300);
+
                     for page_idx in 0..pdfium_page_count {
                         if let Ok(page) = pdfium_doc.pages().get(page_idx as u16) {
                             let page_num = (page_idx + 1) as u32;
                             let pw = page.width().value as f64;
                             let ph = page.height().value as f64;
-                            
-                            // Render page at 200 DPI for OCR
-                            let render_dpi: f64 = 200.0;
-                            let scale = render_dpi / 72.0;
+
+                            let scale = ocr_dpi as f64 / 72.0;
                             let full_w = (pw * scale).round() as i32;
-                            
+
                             let config = pdfium_render::prelude::PdfRenderConfig::new()
                                 .set_target_width(full_w)
                                 .set_maximum_height(full_w * 4);
-                            
+
                             if let Ok(bitmap) = page.render_with_config(&config) {
                                 let page_image: image::DynamicImage = bitmap.as_image();
-                                
-                                // Try OCR on the rendered page
-                                if let Some(ocr_text) = crate::ocr::ocr_image_to_text(&page_image) {
+
+                                if let Some(mut ocr_result) = crate::ocr::ocr_image_to_blocks(&page_image, ocr_dpi) {
                                     ocr_any_text = true;
-                                    log::info!("OCR extracted {} chars from page {}", ocr_text.len(), page_num);
-                                    
-                                    // Add OCR text as paragraphs
-                                    for paragraph in ocr_text.split("\n\n") {
-                                        let para = paragraph.trim();
-                                        if para.is_empty() {
+                                    log::info!(
+                                        "OCR page {}: {} blocks, median height {:.1}px",
+                                        page_num,
+                                        ocr_result.blocks.len(),
+                                        ocr_result.median_text_height
+                                    );
+
+                                    // Reorder blocks into proper reading order (column-aware)
+                                    ocr_reading_order(&mut ocr_result.blocks, ocr_result.page_width);
+
+                                    // Filter noise blocks
+                                    let keep_indices = ocr_filter_noise(&ocr_result.blocks);
+
+                                    // Detect tables among kept blocks
+                                    let kept_blocks: Vec<OcrBlock> = keep_indices
+                                        .iter()
+                                        .map(|&i| ocr_result.blocks[i].clone())
+                                        .collect();
+                                    let tables = detect_ocr_tables(&kept_blocks, ocr_result.page_width);
+
+                                    // Collect block indices consumed by tables
+                                    let mut table_block_set: HashSet<usize> = HashSet::new();
+                                    for table in &tables {
+                                        for &bi in &table.block_indices {
+                                            table_block_set.insert(bi);
+                                        }
+                                    }
+
+                                    // Emit tables
+                                    for table in &tables {
+                                        let num_rows = table.rows.len() as u32;
+                                        let num_cols = table.col_count as u32;
+                                        let mut cells = Vec::new();
+                                        for (r, row) in table.rows.iter().enumerate() {
+                                            for (c, &bi) in row.iter().enumerate() {
+                                                let cell_text = kept_blocks[bi].text();
+                                                cells.push(TableCell {
+                                                    row_span: 1,
+                                                    col_span: 1,
+                                                    start_row_offset_idx: r as u32,
+                                                    end_row_offset_idx: r as u32 + 1,
+                                                    start_col_offset_idx: c as u32,
+                                                    end_col_offset_idx: c as u32 + 1,
+                                                    text: cell_text,
+                                                    column_header: r == 0,
+                                                    row_header: false,
+                                                    row_section: false,
+                                                    fillable: false,
+                                                    formatted_text: None,
+                                                });
+                                            }
+                                        }
+                                        doc.add_table(cells, num_rows, num_cols, None);
+                                    }
+
+                                    // Emit non-table blocks as text with real font size classification
+                                    let body_text_height = ocr_result.median_text_height.max(1.0);
+                                    let mut current_list_group: Option<String> = None;
+
+                                    for (bi, block) in kept_blocks.iter().enumerate() {
+                                        if table_block_set.contains(&bi) {
+                                            current_list_group = None;
                                             continue;
                                         }
-                                        let label = classify_paragraph(para, 12.0, None);
+
+                                        let text = block.text();
+                                        let trimmed = text.trim();
+                                        if trimmed.is_empty() {
+                                            continue;
+                                        }
+
+                                        // Use text height ratio for heading detection
+                                        let size_ratio = block.median_text_height / body_text_height;
+                                        let local_font_size = Some(size_ratio * 12.0);
+                                        let label = classify_paragraph(trimmed, 12.0, local_font_size);
+
                                         match label {
                                             DocItemLabel::Title => {
-                                                doc.add_title(para, None);
+                                                current_list_group = None;
+                                                doc.add_title(trimmed, None);
                                             }
                                             DocItemLabel::SectionHeader => {
-                                                doc.add_section_header(para, 1, None);
+                                                current_list_group = None;
+                                                let level = guess_heading_level(trimmed, size_ratio);
+                                                doc.add_section_header(trimmed, level, None);
+                                            }
+                                            DocItemLabel::ListItem => {
+                                                if current_list_group.is_none() {
+                                                    let enumerated = looks_like_numbered_list(trimmed);
+                                                    let group_label = if enumerated {
+                                                        GroupLabel::OrderedList
+                                                    } else {
+                                                        GroupLabel::List
+                                                    };
+                                                    let gidx = doc.add_group("list", group_label, None);
+                                                    current_list_group = Some(doc.groups[gidx].self_ref.clone());
+                                                }
+                                                let group_ref = current_list_group.as_ref().unwrap();
+                                                let enumerated = looks_like_numbered_list(trimmed);
+                                                let marker = extract_list_marker(trimmed);
+                                                let item_text = strip_list_marker(trimmed);
+                                                doc.add_list_item(&item_text, enumerated, marker.as_deref(), group_ref);
                                             }
                                             _ => {
-                                                doc.add_text(label, para, None);
+                                                current_list_group = None;
+                                                doc.add_text(label, trimmed, None);
                                             }
                                         }
                                     }
-                                    // OCR succeeded - don't add page image since we have the text
-                                } else {
-                                    // OCR failed for this page - add page image as fallback
-                                    emit_full_page_render(
-                                        &mut doc,
-                                        pdfium,
-                                        &data,
-                                        page_idx as usize,
-                                        page_num,
-                                        pw,
-                                        ph,
-                                        &mut seen_image_hashes,
-                                    );
                                 }
+
+                                // Always add page image for referenced-image mode
+                                emit_full_page_render(
+                                    &mut doc,
+                                    pdfium,
+                                    &data,
+                                    page_idx as usize,
+                                    page_num,
+                                    pw,
+                                    ph,
+                                    &mut seen_image_hashes,
+                                );
                             }
                         }
                     }
-                    
+
                     if !ocr_any_text {
                         log::warn!("OCR did not extract any text (Tesseract may not be installed)");
                     }

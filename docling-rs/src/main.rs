@@ -46,9 +46,12 @@ fn main() -> anyhow::Result<()> {
                     .init(),
             }
 
-            // Set OCR flag via environment variable (checked by ocr module)
+            // Set OCR flags via environment variables (checked by backend)
             if args.no_ocr {
                 std::env::set_var("DOCLING_OCR", "0");
+            }
+            if args.ocr_dpi != 300 {
+                std::env::set_var("DOCLING_OCR_DPI", args.ocr_dpi.to_string());
             }
 
             let converter = DocumentConverter::new();
