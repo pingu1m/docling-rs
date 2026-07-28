@@ -149,4 +149,8 @@ pub struct ConvertArgs {
     /// Disable OCR for image-based PDFs (faster but no text extraction)
     #[arg(long = "no-ocr")]
     pub no_ocr: bool,
+
+    /// DPI for OCR page rendering (higher = better accuracy, slower). Default: 300
+    #[arg(long = "ocr-dpi", default_value = "300")]
+    pub ocr_dpi: u32,
 }
